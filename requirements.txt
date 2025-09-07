@@ -6,3 +6,5 @@ ezdxf>=1.0.0
 plyfile>=0.7.0
 pygltflib>=1.0.0
 pytest
+networkx
+lxml

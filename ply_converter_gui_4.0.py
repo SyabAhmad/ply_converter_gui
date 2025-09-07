@@ -168,40 +168,51 @@ class ConversionWorker(QThread):
             return self.transfer_colors_to_mesh(pcd, mesh)
     
     def export_point_cloud_stl(self, pcd, output_path):
-        """
-        Export point cloud to STL using Poisson surface reconstruction for higher accuracy
-        """
+        """Export point cloud to STL using unified preprocessing, normalization, Poisson, then distance pruning."""
         try:
-            # Convert to Open3D point cloud
-            if not isinstance(pcd, o3d.geometry.PointCloud):
-                raise TypeError("pcd must be an Open3D PointCloud")
+            orig_mesh = self._load_original_mesh_if_present()
+            if orig_mesh is not None:
+                # Direct export
+                tri = trimesh.Trimesh(vertices=np.asarray(orig_mesh.vertices),
+                                      faces=np.asarray(orig_mesh.triangles),
+                                      process=True)
+                tri.export(output_path, file_type='stl')
+                print(f"STL (direct) exported successfully: {output_path}")
+                return
 
-            # Remove NaNs or infinite points
-            pcd.remove_non_finite_points()
-
-            # Estimate normals if not present
-            if not pcd.has_normals():
-                pcd.estimate_normals(search_param=o3d.geometry.KDTreeSearchParamKNN(knn=20))
-                pcd.orient_normals_consistent_tangent_plane(160)
-
-            print(f"Performing Poisson surface reconstruction on {len(pcd.points)} points...")
+            # Fallback to reconstruction (only if no faces in PLY)
+            print("No faces in PLY; falling back to Poisson reconstruction for STL...")
+            pcd = self._prepare_point_cloud_for_reconstruction(pcd)
+            norm_pcd, center, scale = self._normalize_point_cloud_for_reconstruction(pcd)
             mesh, densities = o3d.geometry.TriangleMesh.create_from_point_cloud_poisson(
-                pcd, depth=9  # depth controls resolution (higher = more accurate)
-            ) 
-            # Convert Open3D mesh to Trimesh for STL export
-            vertices = np.asarray(mesh.vertices)
-            faces = np.asarray(mesh.triangles)
-            trimesh_mesh = trimesh.Trimesh(vertices=vertices, faces=faces)
-
-            trimesh_mesh.export(output_path, file_type='stl')
-            print(f"STL exported successfully: {output_path}")
+                norm_pcd, depth=8, scale=1.1)
+            # Optional light density trimming
+            try:
+                dens = np.asarray(densities)
+                q = np.quantile(dens, 0.05)
+                mask = dens < q
+                if mask.any():
+                    mesh.remove_vertices_by_mask(mask)
+            except:
+                pass
+            verts = np.asarray(mesh.vertices) * scale + center
+            tri = trimesh.Trimesh(verts, np.asarray(mesh.triangles), process=True)
+            tri.export(output_path, file_type='stl')
+            print(f"STL (Poisson) exported successfully: {output_path}")
         except Exception as e:
             print(f"STL export failed: {e}")
-            # You can implement fallback minimal STL here if needed
     
     def export_point_cloud_3mf(self, pcd, output_path):
         """Export point cloud to 3MF format using Open3D and Poisson surface reconstruction"""
         try:
+            orig_mesh = self._load_original_mesh_if_present()
+            if orig_mesh is not None:
+                tri_mesh = trimesh.Trimesh(vertices=np.asarray(orig_mesh.vertices),
+                                           faces=np.asarray(orig_mesh.triangles),
+                                           process=True)
+                tri_mesh.export(output_path, file_type='3mf')
+                print(f"3MF (direct) exported: {output_path}")
+                return
             # Load the PLY file (ignoring extra properties)
             pcd = o3d.io.read_point_cloud(self.input_path)
             
@@ -243,6 +254,13 @@ class ConversionWorker(QThread):
             # Get positions and colors from Open3D point cloud
             positions = np.asarray(pcd.points).astype(np.float32)
             
+            # Protect against enormous point clouds
+            max_points_for_cubes = 20000
+            if len(positions) > max_points_for_cubes:
+                print(f"Point cloud too large for cube-based 3MF ({len(positions)} points). Downsampling...")
+                pcd = pcd.voxel_down_sample(voxel_size=max(positions.ptp(axis=0).min() * 0.001, 1e-4))
+                positions = np.asarray(pcd.points).astype(np.float32)
+            
             if hasattr(pcd, 'colors') and len(pcd.colors) > 0:
                 colors = np.asarray(pcd.colors).astype(np.float32)
                 # Normalize if needed
@@ -281,8 +299,8 @@ class ConversionWorker(QThread):
                 base_idx = len(all_vertices)
                 all_vertices.extend(cube_vertices)
                 
-                # Define cube faces (6 faces, each with 4 vertices)
-                cube_faces = [
+                # Define cube faces as quads (will be triangulated)
+                cube_quads = [
                     [base_idx, base_idx+1, base_idx+2, base_idx+3],  # bottom
                     [base_idx+4, base_idx+7, base_idx+6, base_idx+5],  # top
                     [base_idx, base_idx+4, base_idx+5, base_idx+1],  # front
@@ -291,14 +309,18 @@ class ConversionWorker(QThread):
                     [base_idx+1, base_idx+5, base_idx+6, base_idx+2]   # right
                 ]
                 
-                all_faces.extend(cube_faces)
+                # Triangulate each quad into two triangles
+                for q in cube_quads:
+                    a, b, c, d = q
+                    all_faces.append([a, b, c])
+                    all_faces.append([a, c, d])
             
-            # Convert to numpy arrays
+            # Convert to numpy arrays (faces are triangles now)
             vertices_array = np.array(all_vertices, dtype=np.float64)
-            faces_array = np.array(all_faces, dtype=np.int32)
+            faces_array = np.array(all_faces, dtype=np.int64);
             
             # Create trimesh and export
-            mesh = trimesh.Trimesh(vertices=vertices_array, faces=faces_array)
+            mesh = trimesh.Trimesh(vertices=vertices_array, faces=faces_array, process=True)
             mesh.export(output_path, file_type='3mf')
             
             print(f"Exported point cloud 3MF with {len(positions)} points using alternative method")
@@ -309,6 +331,24 @@ class ConversionWorker(QThread):
     def export_point_cloud_dxf(self, pcd, output_path):
         """Export point cloud to DXF format using Open3D and Poisson surface reconstruction"""
         try:
+            orig_mesh = self._load_original_mesh_if_present()
+            if orig_mesh is not None:
+                print("Using original mesh for DXF (triangles to 3DFACE).")
+                verts = np.asarray(orig_mesh.vertices)
+                faces = np.asarray(orig_mesh.triangles)
+                doc = ezdxf.new('R2010')
+                msp = doc.modelspace()
+                for f in faces:
+                    v1, v2, v3 = verts[f[0]], verts[f[1]], verts[f[2]]
+                    msp.add_3dface([
+                        [float(v1[0]), float(v1[1]), float(v1[2])],
+                        [float(v2[0]), float(v2[1]), float(v2[2])],
+                        [float(v3[0]), float(v3[1]), float(v3[2])],
+                        [float(v1[0]), float(v1[1]), float(v1[2])]
+                    ])
+                doc.saveas(output_path)
+                print(f"DXF (direct) exported: {output_path}")
+                return
             # Load the PLY file (ignoring extra properties)
             pcd = o3d.io.read_point_cloud(self.input_path)
             
@@ -468,6 +508,15 @@ class ConversionWorker(QThread):
     def export_point_cloud_glb(self, pcd, output_path):
         """Export 3D Gaussian Splatting PLY to GLB format with proper splat rendering"""
         try:
+            orig_mesh = self._load_original_mesh_if_present()
+            if orig_mesh is not None:
+                print("Using original mesh for GLB (no reconstruction).")
+                tri = trimesh.Trimesh(vertices=np.asarray(orig_mesh.vertices),
+                                      faces=np.asarray(orig_mesh.triangles),
+                                      process=True)
+                tri.export(output_path, file_type='glb')
+                print(f"GLB (direct) exported: {output_path}")
+                return
             # For 3D Gaussian Splatting, we need to read the PLY directly to get all properties
             print("Reading 3D Gaussian Splatting PLY file...")
             
@@ -604,21 +653,23 @@ class ConversionWorker(QThread):
             print(f"Alternative GLB export failed: {e}")
     
     def export_gaussian_splats_glb(self, positions, colors_rgba, scales, rotations, output_path):
-        """Export 3D Gaussian Splats to GLB format with continuous surface mesh"""
+        """Export 3D Gaussian Splats to GLB format with continuous surface"""
         try:
-            print("Creating GLB with continuous surface from Gaussian Splat data...")
-              
+            print("Creating GLB with continuous surface from Gaussian Splat data...")              
+            
             pcd = o3d.io.read_point_cloud(self.input_path)
 
-            # o3d.visualization.draw_geometries([pcd]) 
-            
             # Assign colors to the point cloud
             if colors_rgba.shape[1] >= 3:
                 pcd.colors = o3d.utility.Vector3dVector(colors_rgba[:, :3])
             
             # Remove any invalid points
-            pcd.remove_non_finite_points()
-            
+            pcd = self._remove_invalid_points_and_colors(pcd)
+
+            # Keep main cluster and remove planes BEFORE reconstruction
+            pcd = self._keep_largest_cluster(pcd, eps=0.02, min_points=5)
+            pcd = self._remove_planes(pcd, distance_threshold=0.01, ransac_n=3, num_iterations=1000, max_planes=3, min_ratio=0.01)
+
             # Estimate normals for surface reconstruction
             print("Estimating normals for surface reconstruction...")
             pcd.estimate_normals(search_param=o3d.geometry.KDTreeSearchParamHybrid(
@@ -628,17 +679,30 @@ class ConversionWorker(QThread):
             # Try multiple surface reconstruction methods for best results
             print("Attempting surface reconstruction...")
             mesh = None
+            densities = None
             
             # Method 1: Poisson reconstruction with optimized parameters
             try:
                 print("Method 1: Poisson surface reconstruction...")
                 mesh, densities = o3d.geometry.TriangleMesh.create_from_point_cloud_poisson(
-                    pcd, depth=9)               
-
+                    pcd, depth=9)
+                print("Poisson produced a mesh")
             except Exception as e:
                 print(f"Poisson reconstruction failed: {e}")
                 mesh = None
-            # o3d.visualization.draw_geometries([mesh])
+
+            # If Poisson produced a mesh, filter low-density vertices
+            if mesh is not None and densities is not None:
+                try:
+                    dens = np.asarray(densities)
+                    thr = np.quantile(dens, 0.05)
+                    remove_mask = dens < thr
+                    if remove_mask.any():
+                        mesh.remove_vertices_by_mask(remove_mask)
+                        print(f"Filtered {remove_mask.sum()} low-density vertices from Poisson mesh")
+                except Exception as e:
+                    print(f"Poisson density filtering failed: {e}")
+
             # Method 2: Ball pivoting if Poisson fails
             if mesh is None or len(mesh.vertices) == 0:
                 try:
@@ -689,20 +753,23 @@ class ConversionWorker(QThread):
             
             # Optimize mesh topology for better surface quality
             print("Optimizing mesh topology...")
-            mesh = self.optimize_mesh_topology(mesh)
-            
+            mesh = self.optimize_mesh_topology(mesh)   # now supports o3d or trimesh
+
             # Transfer colors from point cloud to mesh vertices
             print("Transferring colors to surface mesh...")
             mesh = self.transfer_colors_to_surface_mesh(pcd, mesh, colors_rgba)
-            
-            # Convert to trimesh and export as GLB
-            print("Exporting continuous surface mesh to GLB...")
-            tri_mesh = trimesh.Trimesh(
-                vertices=np.asarray(mesh.vertices),
-                faces=np.asarray(mesh.triangles),
-                vertex_colors=np.asarray(mesh.vertex_colors) if mesh.has_vertex_colors() else None
-            )
-            
+
+            # If optimize_mesh_topology returned an Open3D mesh convert to trimesh for export
+            if isinstance(mesh, o3d.geometry.TriangleMesh):
+                vertices = np.asarray(mesh.vertices)
+                faces = np.asarray(mesh.triangles)
+                tri_mesh = trimesh.Trimesh(vertices=vertices, faces=faces,
+                                           vertex_colors=(np.asarray(mesh.vertex_colors) 
+                                                          if mesh.has_vertex_colors() else None),
+                                           process=True)
+            else:
+                tri_mesh = mesh
+
             tri_mesh.export(output_path, file_type='glb')
             print(f"Continuous surface GLB exported successfully: {output_path}")
             
@@ -761,13 +828,13 @@ class ConversionWorker(QThread):
         # Convert quaternion to rotation matrix
         w, x, y, z = rotation
         rotation_matrix = np.array([
-            [1-2*y*y-2*z*z, 2*x*y-2*w*z, 2*x*z+2*w*y],
-            [2*x*y+2*w*z, 1-2*x*x-2*z*z, 2*y*z-2*w*x],
-            [2*x*z-2*w*y, 2*y*z+2*w*x, 1-2*x*x-2*y*y]
+            [1-2*y*y-2*z*z, 2*x*y-2*w*z,   2*x*z+2*w*y],
+            [2*x*y+2*w*z,   1-2*x*x-2*z*z, 2*y*z-2-w*x],
+            [2*x*z-2*w*y,   2*y*z+2*w*x,   1-2*x*x-2*y*y]
         ])
         
         # Apply rotation
-        rotated_vertices = np.dot(scaled_vertices, rotation_matrix.T)
+        rotated_vertices = scaled_vertices @ rotation_matrix.T
         
         # Apply translation without position variation
         transformed_vertices = rotated_vertices + position
@@ -921,69 +988,60 @@ class ConversionWorker(QThread):
         try:
             print("Applying mesh topology optimization...")
             
-            # Remove duplicate vertices
-            mesh.remove_duplicated_vertices()
-            
-            # Remove duplicate triangles
-            mesh.remove_duplicated_triangles()
-            
-            # Remove degenerate triangles
-            mesh.remove_degenerate_triangles()
-            
-            # Fill holes in the mesh for continuous surface
-            mesh.fill_holes()
-            
-            # Optimize mesh by removing unnecessary vertices
-            mesh = mesh.simplify_quadric_decimation(
-                target_number_of_triangles=len(mesh.triangles) // 2)
-            
-            # Ensure consistent triangle winding
-            mesh.compute_vertex_normals()
-            
-            print(f"Mesh optimization completed: {len(mesh.vertices)} vertices, {len(mesh.triangles)} faces")
-            return mesh
+            # If an Open3D mesh was passed in, convert to trimesh first
+            if isinstance(mesh, o3d.geometry.TriangleMesh):
+                verts = np.asarray(mesh.vertices)
+                faces = np.asarray(mesh.triangles)
+                # convert to trimesh for topology ops
+                tri = trimesh.Trimesh(vertices=verts, faces=faces, process=True)
+            else:
+                tri = mesh  # assume trimesh.Trimesh
+
+            # Use safe attribute checks because implementations vary
+            if hasattr(tri, "remove_duplicated_vertices"):
+                try:
+                    tri.remove_duplicated_vertices()
+                except Exception:
+                    pass
+            if hasattr(tri, "remove_duplicated_triangles"):
+                try:
+                    tri.remove_duplicated_triangles()
+                except Exception:
+                    pass
+            if hasattr(tri, "remove_degenerate_triangles"):
+                try:
+                    tri.remove_degenerate_triangles()
+                except Exception:
+                    pass
+
+            # Avoid calling fill_holes on Open3D objects. For trimesh, try repair but guard missing deps.
+            try:
+                if hasattr(tri, "repair") and hasattr(tri.repair, "fill_holes"):
+                    tri.repair.fill_holes()
+            except Exception:
+                # repair.fill_holes may require networkx; skip if unavailable
+                pass
+
+            # Conservative simplification if extremely dense
+            try:
+                if hasattr(tri, "triangles") and len(tri.triangles) > 100000:
+                    target = max(50000, len(tri.triangles) // 2)
+                    tri = tri.simplify_quadratic_decimation(target)
+            except Exception:
+                pass
+
+            # Ensure normals are valid
+            try:
+                tri.rezero() if hasattr(tri, "rezero") else None
+                tri.compute_vertex_normals()
+            except Exception:
+                pass
+
+            print(f"Mesh optimization completed: {len(tri.vertices)} vertices, {len(tri.faces) if hasattr(tri, 'faces') else len(tri.triangles)} faces")
+            return tri
             
         except Exception as e:
             print(f"Mesh topology optimization failed: {e}")
-            return mesh
-    
-    def optimize_mesh_preserve_details(self, mesh):
-        """Optimize mesh while preserving important details and preventing thin parts removal"""
-        try:
-            print("Applying detail-preserving mesh optimization...")
-            
-            # Remove duplicate vertices
-            mesh.remove_duplicated_vertices()
-            
-            # Remove duplicate triangles
-            mesh.remove_duplicated_triangles()
-            
-            # Remove degenerate triangles (very small triangles that can cause issues)
-            mesh.remove_degenerate_triangles()
-            
-            # Fill holes to ensure continuous surface
-            mesh.fill_holes()
-            
-            # Apply conservative mesh simplification to preserve details
-            # Only simplify if the mesh is very dense
-            if len(mesh.triangles) > 100000:
-                target_triangles = max(50000, len(mesh.triangles) // 2)
-                print(f"Applying conservative simplification: {len(mesh.triangles)} -> {target_triangles}")
-                mesh = mesh.simplify_quadric_decimation(target_number_of_triangles=target_triangles)
-            
-            # Ensure consistent triangle winding
-            mesh.compute_vertex_normals()
-            
-            # Apply light smoothing to reduce artifacts while preserving details
-            print("Applying light smoothing to reduce artifacts...")
-            mesh = mesh.filter_smooth_simple(number_of_iterations=1)
-            mesh = mesh.filter_smooth_laplacian(number_of_iterations=1)
-            
-            print(f"Mesh optimization completed: {len(mesh.vertices)} vertices, {len(mesh.triangles)} faces")
-            return mesh
-            
-        except Exception as e:
-            print(f"Mesh optimization failed: {e}")
             return mesh
     
     def advanced_point_cloud_preprocessing(self, pcd):
@@ -1070,7 +1128,279 @@ class ConversionWorker(QThread):
             print(f"Scale preservation failed: {e}")
             return scales
     
-    # Removed old convert methods - now using point cloud export methods
+    def _remove_invalid_points_and_colors(self, pcd):
+        """Return a cleaned point cloud with non-finite points removed (keeps colors aligned)."""
+        pts = np.asarray(pcd.points)
+        mask = np.isfinite(pts).all(axis=1)
+        if mask.all():
+            return pcd
+        pts_clean = pts[mask]
+        new_pcd = o3d.geometry.PointCloud()
+        new_pcd.points = o3d.utility.Vector3dVector(pts_clean)
+        if pcd.has_colors():
+            cols = np.asarray(pcd.colors)[mask]
+            new_pcd.colors = o3d.utility.Vector3dVector(cols)
+        if pcd.has_normals():
+            normals = np.asarray(pcd.normals)[mask]
+            new_pcd.normals = o3d.utility.Vector3dVector(normals)
+        return new_pcd
+    
+    def _keep_largest_cluster(self, pcd, eps=0.02, min_points=10):
+        """Keep only the largest DBSCAN cluster in the point cloud."""
+        try:
+            labels = np.array(pcd.cluster_dbscan(eps=eps, min_points=min_points, print_progress=False))
+            if labels.size == 0:
+                return pcd
+            unique, counts = np.unique(labels[labels >= 0], return_counts=True)
+            if unique.size == 0:
+                return pcd
+            largest_label = unique[np.argmax(counts)]
+            indices = np.where(labels == largest_label)[0].tolist()
+            return pcd.select_by_index(indices)
+        except Exception as e:
+            print(f"_keep_largest_cluster skipped: {e}")
+            return pcd
+
+    def _remove_planes(self, pcd, distance_threshold=0.01, ransac_n=3, num_iterations=1000, max_planes=3, min_ratio=0.01):
+        """Iteratively remove large planar components from the point cloud."""
+        try:
+            remaining = pcd
+            for i in range(max_planes):
+                if len(remaining.points) < 50:
+                    break
+                plane_model, inliers = remaining.segment_plane(distance_threshold=distance_threshold,
+                                                               ransac_n=ransac_n,
+                                                               num_iterations=num_iterations)
+                if len(inliers) == 0:
+                    break
+                frac = len(inliers) / max(1, len(remaining.points))
+                if frac < min_ratio:
+                    break
+                print(f"Removing plane #{i+1}: {len(inliers)} points ({frac:.2%})")
+                remaining = remaining.select_by_index(inliers, invert=True)
+            return remaining
+        except Exception as e:
+            print(f"_remove_planes skipped: {e}")
+            return pcd
+
+    def _remove_flat_mesh_components(self, tri_mesh,
+                                     thickness_tol=0.006,
+                                     area_ratio_threshold=0.03):
+        """
+        Remove large, nearly planar components (e.g., base plate).
+        thickness_tol: max thickness (smallest bbox axis) to treat as flat
+        area_ratio_threshold: min area fraction of total to consider for removal
+        """
+        try:
+            # Split into connected components (works for non‑watertight too)
+            parts = tri_mesh.split(only_watertight=False)
+            if len(parts) <= 1:
+                return tri_mesh
+
+            total_area = sum(p.area for p in parts if p.area is not None)
+            kept = []
+            removed_count = 0
+
+            for idx, part in enumerate(parts):
+                if part.area is None or part.area == 0:
+                    kept.append(part)
+                    continue
+                bbox_min, bbox_max = part.bounds
+                extents = bbox_max - bbox_min
+                smallest = np.min(extents)
+                area_ratio = part.area / (total_area + 1e-9)
+
+                print(f"Component {idx}: area={part.area:.4f} ratio={area_ratio:.3f} "
+                      f"extents={extents} smallest={smallest:.5f}")
+
+                if smallest < thickness_tol and area_ratio > area_ratio_threshold:
+                    print(f"Removing flat component {idx} (area_ratio={area_ratio:.3f}, smallest={smallest:.5f})")
+                    removed_count += 1
+                else:
+                    kept.append(part)
+
+            if removed_count == 0:
+                return tri_mesh
+
+            combined = trimesh.util.concatenate(kept)
+            print(f"Removed {removed_count} flat component(s); new mesh: {len(combined.vertices)} verts, {len(combined.faces)} faces")
+            return combined
+        except Exception as e:
+            print(f"_remove_flat_mesh_components skipped: {e}")
+            return tri_mesh
+        
+    def _prepare_point_cloud_for_reconstruction(self, pcd,
+                                                cluster_eps=0.02,
+                                                cluster_min_points=8,
+                                                plane_dist=0.01,
+                                                max_planes=4,
+                                                plane_min_ratio=0.01,
+                                                z_trim_quantile=0.02):
+        """Unified preprocessing: invalid removal, largest cluster, plane removal, low-Z trim, normals."""
+        try:
+            pcd = self._remove_invalid_points_and_colors(pcd)
+
+            # Largest cluster only
+            pcd = self._keep_largest_cluster(pcd, eps=cluster_eps, min_points=cluster_min_points)
+
+            # Iterative plane removal
+            pcd = self._remove_planes(pcd,
+                                      distance_threshold=plane_dist,
+                                      max_planes=max_planes,
+                                      min_ratio=plane_min_ratio)
+
+            # Optional: trim very lowest Z band (often ground / tray)
+            pts = np.asarray(pcd.points)
+            if len(pts) > 20:
+                z = pts[:, 2]
+                z_min = np.quantile(z, z_trim_quantile)
+                # Keep points above a small offset
+                keep = z > z_min + (np.ptp(z) * 0.005)
+                if keep.sum() > 30 and keep.sum() < len(pts):
+                    removed = len(pts) - keep.sum()
+                    print(f"Z-trim removed {removed} low points (ground slice)")
+                    pcd = pcd.select_by_index(np.where(keep)[0])
+
+            # Normals
+            if not pcd.has_normals():
+                pcd.estimate_normals(search_param=o3d.geometry.KDTreeSearchParamHybrid(
+                    radius=0.08, max_nn=60))
+                pcd.orient_normals_consistent_tangent_plane(k=120)
+            return pcd
+        except Exception as e:
+            print(f"_prepare_point_cloud_for_reconstruction failed: {e}")
+            return pcd
+
+    def _normalize_point_cloud_for_reconstruction(self, pcd):
+        """
+        Return (normalized_pcd, center, scale).
+        Scales so max axis extent becomes 1.0 (isotropic), centers at origin.
+        """
+        try:
+            pts = np.asarray(pcd.points)
+            center = pts.mean(axis=0)
+            shifted = pts - center
+            extents = np.ptp(shifted, axis=0)   # NumPy 2.0 compatible
+            scale = extents.max() if extents.max() > 0 else 1.0
+            norm_pts = shifted / scale
+            np_pcd = o3d.geometry.PointCloud()
+            np_pcd.points = o3d.utility.Vector3dVector(norm_pts)
+            if pcd.has_colors():
+                np_pcd.colors = pcd.colors
+            if pcd.has_normals():
+                np_pcd.normals = pcd.normals
+            return np_pcd, center, scale
+        except Exception as e:
+            print(f"_normalize_point_cloud_for_reconstruction failed: {e}")
+            return pcd, np.zeros(3), 1.0
+
+    def _prune_mesh_by_point_distance(self, tri_mesh, pcd,
+                                      distance_factor=4.0,
+                                      absolute_max=None,
+                                      keep_ratio=0.98):
+        """
+        Remove vertices (and attached faces) whose nearest distance to original
+        points is too large (likely Poisson sheet / plate).
+        distance_factor * median_distance sets threshold (clamped by absolute_max if given).
+        keep_ratio: ensure we don't delete too much; abort if deletions would exceed (1-keep_ratio).
+        """
+        try:
+            pts = np.asarray(pcd.points)
+            if len(pts) == 0 or len(tri_mesh.vertices) == 0:
+                return tri_mesh
+
+            # KDTree on original points
+            import scipy.spatial
+            tree = scipy.spatial.cKDTree(pts)
+
+            v = tri_mesh.vertices
+            dists, _ = tree.query(v, k=1, workers=-1)
+            med = np.median(dists)
+            thr = med * distance_factor
+            if absolute_max is not None:
+                thr = min(thr, absolute_max)
+
+            mask_remove = dists > thr
+            remove_count = int(mask_remove.sum())
+            frac_remove = remove_count / len(v)
+
+            print(f"Vertex distance pruning: median={med:.6f}  thr={thr:.6f}  "
+                  f"remove={remove_count} ({frac_remove:.2%})")
+
+            # Safety: if removal would nuke most of mesh, skip
+            if frac_remove > (1 - keep_ratio):
+                print("Pruning skipped (too many vertices marked).")
+                return tri_mesh
+
+            if remove_count == 0:
+                return tri_mesh
+
+            tri_mesh.update_vertices(~mask_remove)
+            tri_mesh.remove_unreferenced_vertices()
+
+            # Optional: remove now-small orphan components
+            parts = tri_mesh.split(only_watertight=False)
+            if len(parts) > 1:
+                areas = np.array([p.area for p in parts])
+                main_idx = areas.argmax()
+                kept = [parts[main_idx]]
+                for i, p in enumerate(parts):
+                    if i == main_idx:
+                        continue
+                    if p.area / areas[main_idx] > 0.01:  # keep if >1% of main
+                        kept.append(p)
+                tri_mesh = trimesh.util.concatenate(kept)
+                print(f"Pruning components: kept {len(kept)} merged parts.")
+
+            # Recompute normals if available
+            try:
+                tri_mesh.compute_vertex_normals()
+            except Exception:
+                pass
+
+            return tri_mesh
+        except Exception as e:
+            print(f"_prune_mesh_by_point_distance failed: {e}")
+            return tri_mesh
+
+    def _load_original_mesh_if_present(self):
+        """
+        Try to load the original triangle mesh from the PLY.
+        Returns (o3d_mesh or None). If mesh has triangles, we use it directly.
+        """
+        try:
+            mesh = o3d.io.read_triangle_mesh(self.input_path)
+            if mesh and len(mesh.vertices) and len(mesh.triangles):
+                if not mesh.has_vertex_normals():
+                    mesh.compute_vertex_normals()
+                print(f"Detected original mesh in PLY: {len(mesh.vertices)} verts, {len(mesh.triangles)} faces")
+                return mesh
+        except Exception as e:
+            print(f"read_triangle_mesh fallback failed: {e}")
+        # Fallback manual parse (only if needed)
+        try:
+            from plyfile import PlyData
+            ply = PlyData.read(self.input_path)
+            if 'vertex' in ply and 'face' in ply:
+                vx = np.column_stack([ply['vertex'][c] for c in ('x','y','z')]).astype(np.float64)
+                faces = []
+                for f in ply['face'].data['vertex_indices']:
+                    if len(f) == 3:
+                        faces.append(f)
+                    elif len(f) == 4:
+                        # triangulate quad
+                        faces.append([f[0], f[1], f[2]])
+                        faces.append([f[0], f[2], f[3]])
+                if faces:
+                    o3d_mesh = o3d.geometry.TriangleMesh()
+                    o3d_mesh.vertices = o3d.utility.Vector3dVector(vx)
+                    o3d_mesh.triangles = o3d.utility.Vector3iVector(np.array(faces, dtype=np.int32))
+                    o3d_mesh.compute_vertex_normals()
+                    print(f"Manual PLY mesh load: {len(vx)} verts, {len(faces)} faces")
+                    return o3d_mesh
+        except Exception as e:
+            print(f"Manual PLY mesh parse failed: {e}")
+        return None
 
 class PLYConverterGUI(QMainWindow):
     def __init__(self):
@@ -1317,22 +1647,24 @@ class PLYConverterGUI(QMainWindow):
         self.statusBar().showMessage("Converting...")
     
     def update_progress(self, message):         
-        # Update progress bar based on message content
-        if "Loading 3D Gaussian Splatting PLY" in message:
+        # Display status message
+        self.statusBar().showMessage(message)
+        m = message.lower()
+        if "loading 3d gaussian splatting ply" in m or "loading" in m:
             self.progress_bar.setValue(10)
-        elif "Pre-processing" in message:
+        elif "pre-processing" in m or "preprocessing" in m:
             self.progress_bar.setValue(25)
-        elif "Processing colors" in message:
+        elif "processing" in m or "color" in m:
             self.progress_bar.setValue(35)
-        elif "Exporting to STL (Gaussian splats)" in message:
+        elif "exporting to stl" in m:
             self.progress_bar.setValue(50)
-        elif "Exporting to GLB (3D Gaussian Splats)" in message:
+        elif "exporting to glb" in m:
             self.progress_bar.setValue(65)
-        elif "Exporting to 3MF (Gaussian splats)" in message:
+        elif "exporting to 3mf" in m:
             self.progress_bar.setValue(80)
-        elif "Exporting to DXF (Gaussian splats)" in message:
+        elif "exporting to dxf" in m:
             self.progress_bar.setValue(90)
-        elif "Conversion complete" in message:
+        elif "conversion complete" in m or "completed" in m:
             self.progress_bar.setValue(100)
     
     def conversion_finished(self, success, message):
