@@ -39,7 +39,7 @@ class ConversionWorker(QThread):
             # Load / cache base point cloud once
             pcd = self._get_base_pcd()
             self.progress.emit(f"Loaded {len(pcd.points)} Gaussian splats")
-            # Light optional downsample already done inside _get_base_pcd
+            # Light optional downsample already done inside _get_pcd
             # Color enhancement already applied there if present
             # Build (once) surface mesh if needed by mesh formats
             surface_mesh = self._get_surface_mesh(pcd)
@@ -411,332 +411,6 @@ class ConversionWorker(QThread):
         except Exception as e:
             print(f"GLB export failed: {e}")
 
-    def _get_base_pcd(self):
-        """Load & lightly preprocess once."""
-        if self._cached_pcd is not None:
-            return self._cached_pcd
-        self.progress.emit("Loading point cloud...")
-        pcd = o3d.io.read_point_cloud(self.input_path)
-        if len(pcd.points) > 200000:  # adaptive quick downsample
-            vs = max(0.001, float(np.ptp(np.asarray(pcd.points), axis=0).max()) * 0.003)
-            pcd = pcd.voxel_down_sample(vs)
-            self.progress.emit(f"Downsampled to {len(pcd.points)} points (voxel={vs:.4g})")
-        if pcd.has_colors():
-            cols = np.asarray(pcd.colors)
-            if cols.max() > 1.0:
-                cols = cols / 255.0
-            pcd.colors = o3d.utility.Vector3dVector(np.clip(cols, 0, 1))
-        self._cached_pcd = pcd
-        return pcd
-
-    def _get_surface_mesh(self, pcd):
-        """Build Poisson surface once (cached)."""
-        if self._cached_mesh is not None:
-            return self._cached_mesh
-        orig_mesh = self._load_original_mesh_if_present()
-        if orig_mesh is not None and len(orig_mesh.triangles) > 0:
-            self._cached_mesh = orig_mesh
-            return self._cached_mesh
-        self.progress.emit("Preparing surface reconstruction...")
-        prep = self._prepare_point_cloud_for_reconstruction(pcd)
-        if not prep.has_normals():
-            prep.estimate_normals(o3d.geometry.KDTreeSearchParamHybrid(radius=0.02, max_nn=60))
-        # Adaptive Poisson depth
-        n = len(prep.points)
-        if n < 50000:
-            depth = 8
-        elif n < 200000:
-            depth = 9
-        else:
-            depth = 10 if not self.high_detail else 11
-        self.progress.emit(f"Running Poisson (depth={depth}) once...")
-        mesh, _ = o3d.geometry.TriangleMesh.create_from_point_cloud_poisson(prep, depth=depth, scale=1.02)
-        # Light cleanup (skip heavy per‑export)
-        mesh.remove_unreferenced_vertices()
-        if len(mesh.vertices) > 0:
-            mesh.compute_vertex_normals()
-        self._cached_surface_pcd = prep
-        self._cached_mesh = mesh
-        return mesh
-
-    def export_point_cloud_stl(self, pcd, output_path, mesh=None):
-        """Export STL reusing cached mesh if provided."""
-        try:
-            orig_mesh = self._load_original_mesh_if_present()
-            if orig_mesh is not None:
-                tri = trimesh.Trimesh(vertices=np.asarray(orig_mesh.vertices),
-                                      faces=np.asarray(orig_mesh.triangles),
-                                      process=True)
-                tri.export(output_path, file_type='stl')
-                return
-            if mesh is None:
-                mesh = self._get_surface_mesh(pcd)
-            if mesh is None or len(mesh.triangles) == 0:
-                print("No mesh for STL.")
-                return
-            tri = trimesh.Trimesh(vertices=np.asarray(mesh.vertices),
-                                  faces=np.asarray(mesh.triangles),
-                                  process=True)
-            tri.export(output_path, file_type='stl')
-        except Exception as e:
-            print(f"STL export failed: {e}")
-
-    def export_point_cloud_3mf(self, pcd, output_path, mesh=None):
-        """Reuse cached mesh; skip cube fallback on large clouds."""
-        try:
-            orig_mesh = self._load_original_mesh_if_present()
-            if orig_mesh is not None:
-                trimesh.Trimesh(np.asarray(orig_mesh.vertices),
-                                np.asarray(orig_mesh.triangles),
-                                process=True).export(output_path, file_type='3mf')
-                return
-            if mesh is None:
-                mesh = self._get_surface_mesh(pcd)
-            if mesh is None or len(mesh.triangles) == 0:
-                print("No surface mesh; skipping 3MF (avoid huge cube fallback).")
-                return
-            tri_mesh = trimesh.Trimesh(vertices=np.asarray(mesh.vertices),
-                                       faces=np.asarray(mesh.triangles),
-                                       process=True)
-            tri_mesh.export(output_path, file_type='3mf')
-        except Exception as e:
-            print(f"3MF export failed: {e}")
-
-    def export_point_cloud_dxf(self, pcd, output_path, mesh=None):
-        """Reuse cached mesh for DXF."""
-        try:
-            orig_mesh = self._load_original_mesh_if_present()
-            if orig_mesh is not None:
-                verts = np.asarray(orig_mesh.vertices)
-                faces = np.asarray(orig_mesh.triangles)
-            else:
-                if mesh is None:
-                    mesh = self._get_surface_mesh(pcd)
-                if mesh is None or len(mesh.triangles) == 0:
-                    print("No surface mesh; DXF skipped.")
-                    return
-                verts = np.asarray(mesh.vertices)
-                faces = np.asarray(mesh.triangles)
-            import ezdxf
-            doc = ezdxf.new('R2010')
-            msp = doc.modelspace()
-            for f in faces:
-                v1, v2, v3 = verts[f[0]], verts[f[1]], verts[f[2]]
-                msp.add_3dface([
-                    [float(v1[0]), float(v1[1]), float(v1[2])],
-                    [float(v2[0]), float(v2[1]), float(v2[2])],
-                    [float(v3[0]), float(v3[1]), float(v3[2])],
-                    [float(v1[0]), float(v1[1]), float(v1[2])]
-                ])
-            doc.saveas(output_path)
-        except Exception as e:
-            print(f"DXF export failed: {e}")
-
-    def export_point_cloud_glb(self, pcd, output_path):
-        """If mesh already cached, reuse it for surface GLB; else fallback to point cloud."""
-        try:
-            orig_mesh = self._load_original_mesh_if_present()
-            if orig_mesh is not None:
-                trimesh.Trimesh(vertices=np.asarray(orig_mesh.vertices),
-                                faces=np.asarray(orig_mesh.triangles),
-                                process=True).export(output_path, file_type='glb')
-                return
-            mesh = self._cached_mesh  # may already exist
-            if mesh is not None and len(mesh.triangles) > 0:
-                tri = trimesh.Trimesh(vertices=np.asarray(mesh.vertices),
-                                      faces=np.asarray(mesh.triangles),
-                                      process=True)
-                tri.export(output_path, file_type='glb')
-                return
-            # Fallback: simple point cloud GLB
-            positions = np.asarray(pcd.points).astype(np.float32)
-            if pcd.has_colors():
-                cols = np.asarray(pcd.colors).astype(np.float32)
-                if cols.max() > 1.0: cols /= 255.0
-            else:
-                cols = np.ones((len(positions), 3), dtype=np.float32)
-            colors_rgba = np.column_stack((cols, np.ones(len(cols), dtype=np.float32)))
-            self.export_simple_gaussian_glb(positions, colors_rgba, output_path)
-        except Exception as e:
-            print(f"GLB export failed: {e}")
-
-    def enhance_colors_vectorized(self, rgb_colors):
-        """Preserve original colors without enhancement"""
-        # Simply normalize colors to 0-1 range
-        rgb = rgb_colors[:, :3]
-        # Only normalize if values are above 1.0 (likely 0-255 range)
-        if rgb.max() > 1.0:
-            rgb = rgb / 255.0
-        # Ensure values stay in valid range
-        rgb = np.clip(rgb, 0, 1)
-        # Combine with original alpha if available
-        if rgb_colors.shape[1] > 3:
-            result = np.column_stack((rgb, rgb_colors[:, 3]))
-        else:
-            result = rgb
-        return result
-
-    def transfer_colors_to_mesh(self, pcd, mesh):
-        """Transfer colors from point cloud to mesh vertices using nearest neighbor"""
-        try:
-            import open3d as o3d
-            # Get point cloud points and colors
-            pcd_points = np.asarray(pcd.points)
-            pcd_colors = np.asarray(pcd.colors)
-            # Get mesh vertices
-            mesh_vertices = np.asarray(mesh.vertices)
-            # Create a KDTree for efficient nearest neighbor search
-            pcd_tree = o3d.geometry.KDTreeFlann(pcd)
-            # For each mesh vertex, find the nearest point cloud point and use its color
-            mesh_colors = np.zeros((len(mesh_vertices), 3), dtype=np.float32)
-            for i, vertex in enumerate(mesh_vertices):
-                # Find nearest neighbor
-                [k, idx, _] = pcd_tree.search_knn_vector_3d(vertex, 1)
-                if len(idx) > 0:
-                    mesh_colors[i] = pcd_colors[idx[0]]
-            # Assign colors to mesh
-            mesh.vertex_colors = o3d.utility.Vector3dVector(mesh_colors)
-            print(f"Transferred colors from {len(pcd_points)} points to {len(mesh_vertices)} mesh vertices")
-            return mesh
-        except Exception as e:
-            print(f"Color transfer failed: {e}")
-            return mesh
-
-    def transfer_colors_to_mesh_enhanced(self, pcd, mesh, original_colors):
-        """Enhanced color transfer with better color preservation and smoothing"""
-        try:
-            import open3d as o3d
-            # Get point cloud points and colors
-            pcd_points = np.asarray(pcd.points)
-            mesh_vertices = np.asarray(mesh.vertices)
-            # Create a KDTree for efficient nearest neighbor search
-            pcd_tree = o3d.geometry.KDTreeFlann(pcd)
-            # For each mesh vertex, find multiple nearest neighbors and interpolate colors
-            mesh_colors = np.zeros((len(mesh_vertices), 3), dtype=np.float32)
-            for i, vertex in enumerate(mesh_vertices):
-                # Find 5 nearest neighbors for better color interpolation
-                [k, idx, dist] = pcd_tree.search_knn_vector_3d(vertex, 5)
-                if len(idx) > 0:
-                    # Weight colors by distance (closer points have more influence)
-                    weights = 1.0 / (dist + 1e-6)  # Add small epsilon to avoid division by zero
-                    weights = weights / np.sum(weights)  # Normalize weights
-                    # Interpolate colors using weighted average
-                    interpolated_color = np.zeros(3, dtype=np.float32)
-                    for j, neighbor_idx in enumerate(idx):
-                        interpolated_color += original_colors[neighbor_idx] * weights[j]
-                    mesh_colors[i] = interpolated_color
-            # Apply color enhancement to make colors more vivid (like real ham)
-            enhanced_colors = self.enhance_colors_vectorized(mesh_colors)
-            # Assign enhanced colors to mesh
-            mesh.vertex_colors = o3d.utility.Vector3dVector(enhanced_colors)
-            print(f"Enhanced color transfer completed: {len(mesh_vertices)} vertices with vivid colors")
-            return mesh
-        except Exception as e:
-            print(f"Enhanced color transfer failed: {e}")
-            # Fallback to simple color transfer
-            return self.transfer_colors_to_mesh(pcd, mesh)
-
-    def export_point_cloud_stl(self, pcd, output_path, mesh=None):
-        """Export STL reusing cached mesh if provided."""
-        try:
-            orig_mesh = self._load_original_mesh_if_present()
-            if orig_mesh is not None:
-                tri = trimesh.Trimesh(vertices=np.asarray(orig_mesh.vertices),
-                                      faces=np.asarray(orig_mesh.triangles),
-                                      process=True)
-                tri.export(output_path, file_type='stl')
-                return
-            if mesh is None:
-                mesh = self._get_surface_mesh(pcd)
-            if mesh is None or len(mesh.triangles) == 0:
-                print("No mesh for STL.")
-                return
-            tri = trimesh.Trimesh(vertices=np.asarray(mesh.vertices),
-                                  faces=np.asarray(mesh.triangles),
-                                  process=True)
-            tri.export(output_path, file_type='stl')
-        except Exception as e:
-            print(f"STL export failed: {e}")
-
-    def export_point_cloud_3mf(self, pcd, output_path, mesh=None):
-        """Reuse cached mesh; skip cube fallback on large clouds."""
-        try:
-            orig_mesh = self._load_original_mesh_if_present()
-            if orig_mesh is not None:
-                trimesh.Trimesh(np.asarray(orig_mesh.vertices),
-                                np.asarray(orig_mesh.triangles),
-                                process=True).export(output_path, file_type='3mf')
-                return
-            if mesh is None:
-                mesh = self._get_surface_mesh(pcd)
-            if mesh is None or len(mesh.triangles) == 0:
-                print("No surface mesh; skipping 3MF (avoid huge cube fallback).")
-                return
-            tri_mesh = trimesh.Trimesh(vertices=np.asarray(mesh.vertices),
-                                       faces=np.asarray(mesh.triangles),
-                                       process=True)
-            tri_mesh.export(output_path, file_type='3mf')
-        except Exception as e:
-            print(f"3MF export failed: {e}")
-
-    def export_point_cloud_dxf(self, pcd, output_path, mesh=None):
-        """Reuse cached mesh for DXF."""
-        try:
-            orig_mesh = self._load_original_mesh_if_present()
-            if orig_mesh is not None:
-                verts = np.asarray(orig_mesh.vertices)
-                faces = np.asarray(orig_mesh.triangles)
-            else:
-                if mesh is None:
-                    mesh = self._get_surface_mesh(pcd)
-                if mesh is None or len(mesh.triangles) == 0:
-                    print("No surface mesh; DXF skipped.")
-                    return
-                verts = np.asarray(mesh.vertices)
-                faces = np.asarray(mesh.triangles)
-            import ezdxf
-            doc = ezdxf.new('R2010')
-            msp = doc.modelspace()
-            for f in faces:
-                v1, v2, v3 = verts[f[0]], verts[f[1]], verts[f[2]]
-                msp.add_3dface([
-                    [float(v1[0]), float(v1[1]), float(v1[2])],
-                    [float(v2[0]), float(v2[1]), float(v2[2])],
-                    [float(v3[0]), float(v3[1]), float(v3[2])],
-                    [float(v1[0]), float(v1[1]), float(v1[2])]
-                ])
-            doc.saveas(output_path)
-        except Exception as e:
-            print(f"DXF export failed: {e}")
-
-    def export_point_cloud_glb(self, pcd, output_path):
-        """If mesh already cached, reuse it for surface GLB; else fallback to point cloud."""
-        try:
-            orig_mesh = self._load_original_mesh_if_present()
-            if orig_mesh is not None:
-                trimesh.Trimesh(vertices=np.asarray(orig_mesh.vertices),
-                                faces=np.asarray(orig_mesh.triangles),
-                                process=True).export(output_path, file_type='glb')
-                return
-            mesh = self._cached_mesh  # may already exist
-            if mesh is not None and len(mesh.triangles) > 0:
-                tri = trimesh.Trimesh(vertices=np.asarray(mesh.vertices),
-                                      faces=np.asarray(mesh.triangles),
-                                      process=True)
-                tri.export(output_path, file_type='glb')
-                return
-            # Fallback: simple point cloud GLB
-            positions = np.asarray(pcd.points).astype(np.float32)
-            if pcd.has_colors():
-                cols = np.asarray(pcd.colors).astype(np.float32)
-                if cols.max() > 1.0: cols /= 255.0
-            else:
-                cols = np.ones((len(positions), 3), dtype=np.float32)
-            colors_rgba = np.column_stack((cols, np.ones(len(cols), dtype=np.float32)))
-            self.export_simple_gaussian_glb(positions, colors_rgba, output_path)
-        except Exception as e:
-            print(f"GLB export failed: {e}")
-
     def create_ellipsoid_mesh(self, lat_segments, lon_segments):
         """Create a high-quality base ellipsoid mesh (unit sphere) with smooth surface"""
         vertices = []
@@ -816,6 +490,197 @@ class ConversionWorker(QThread):
                 nodes=[node],
                 meshes=[mesh],
                 buffers=[buffer],
+                bufferViews=[bv_positions, bv_colors],
+                accessors=[acc_positions, acc_colors]
+            )
+            # Attach binary data and save
+            gltf.set_binary_blob(bin_blob)
+            gltf.save_binary(output_path)
+            print(f"Fallback point cloud GLB exported: {output_path}")
+        except Exception as e:
+            print(f"Fallback GLB export also failed: {e}")
+
+    def smooth_mesh_for_ham(self, mesh):
+        """Apply specialized smoothing to make the mesh look more like real ham"""
+        try:
+            # Convert to Open3D mesh for better smoothing
+            o3d_mesh = o3d.geometry.TriangleMesh()
+            o3d_mesh.vertices = o3d.utility.Vector3dVector(mesh.vertices)
+            o3d_mesh.triangles = o3d.utility.Vector3iVector(mesh.faces)
+            o3d_mesh.vertex_colors = o3d.utility.Vector3dVector(mesh.vertex_colors)
+            # Apply multiple smoothing passes for organic appearance
+            print("Applying organic smoothing passes...")
+            # First pass: light smoothing to reduce sharp edges
+            o3d_mesh = o3d_mesh.filter_smooth_simple(number_of_iterations=2)
+            # Second pass: Laplacian smoothing for more natural curves
+            o3d_mesh = o3d_mesh.filter_smooth_laplacian(number_of_iterations=3)
+            # Third pass: Taubin smoothing to prevent over-smoothing
+            o3d_mesh = o3d_mesh.filter_smooth_taubin(number_of_iterations=2)
+            # Recompute normals for better lighting
+            o3d_mesh.compute_vertex_normals()
+            # Convert back to trimesh
+            smoothed_mesh = trimesh.Trimesh(
+                vertices=np.asarray(o3d_mesh.vertices),
+                faces=np.asarray(o3d_mesh.triangles),
+                vertex_colors=np.asarray(o3d_mesh.vertex_colors)
+            )
+            print("Mesh smoothing completed for realistic ham appearance")
+            return smoothed_mesh
+        except Exception as e:
+            print(f"Mesh smoothing failed: {e}")
+            return mesh
+
+    def smooth_mesh_for_ham_o3d(self, o3d_mesh):
+        """Apply specialized smoothing to Open3D mesh for realistic ham appearance"""
+        try:
+            print("Applying organic smoothing passes to Open3D mesh...")
+            # First pass: light smoothing to reduce sharp edges
+            o3d_mesh = o3d_mesh.filter_smooth_simple(number_of_iterations=3)
+            # Second pass: Laplacian smoothing for more natural curves
+            o3d_mesh = o3d_mesh.filter_smooth_laplacian(number_of_iterations=4)
+            # Third pass: Taubin smoothing to prevent over-smoothing
+            o3d_mesh = o3d_mesh.filter_smooth_taubin(number_of_iterations=3)
+            # Recompute normals for better lighting
+            o3d_mesh.compute_vertex_normals()
+            print("Open3D mesh smoothing completed for realistic ham appearance")
+            return o3d_mesh
+        except Exception as e:
+            print(f"Open3D mesh smoothing failed: {e}")
+            return o3d_mesh
+
+    def transfer_colors_to_surface_mesh(self, pcd, mesh, colors_rgba):
+        """Transfer colors from point cloud to surface mesh vertices using nearest neighbor"""
+        try:
+            # Get point cloud points and colors
+            pcd_points = np.asarray(pcd.points)
+            mesh_vertices = np.asarray(mesh.vertices)
+            # Create a KDTree for efficient nearest neighbor search
+            pcd_tree = o3d.geometry.KDTreeFlann(pcd)
+            # For each mesh vertex, find the nearest point cloud point and use its color
+            mesh_colors = np.zeros((len(mesh_vertices), 3), dtype=np.float32)
+            for i, vertex in enumerate(mesh_vertices):
+                # Find nearest neighbor
+                [k, idx, dist] = pcd_tree.search_knn_vector_3d(vertex, 1)
+                if len(idx) > 0:
+                    # Get color from nearest point
+                    mesh_colors[i] = colors_rgba[idx[0]][:3]
+            # Apply color enhancement for realistic ham appearance
+            enhanced_colors = self.apply_ham_color_enhancement(mesh_colors)
+            # Assign enhanced colors to mesh
+            mesh.vertex_colors = o3d.utility.Vector3dVector(enhanced_colors)
+            print(f"Transferred and enhanced colors from {len(pcd_points)} points to {len(mesh_vertices)} mesh vertices")
+            return mesh
+        except Exception as e:
+            print(f"Color transfer to surface mesh failed: {e}")
+            return mesh
+
+    def optimize_mesh_topology(self, mesh):
+        """Optimize mesh topology for better surface quality and ham-like appearance"""
+        try:
+            print("Applying mesh topology optimization...")
+            # If an Open3D mesh was passed in, convert to trimesh first
+            if isinstance(mesh, o3d.geometry.TriangleMesh):
+                verts = np.asarray(mesh.vertices)
+                faces = np.asarray(mesh.triangles)
+                # convert to trimesh for topology ops
+                tri = trimesh.Trimesh(vertices=verts, faces=faces, process=True)
+            else:
+                tri = mesh  # assume trimesh.Trimesh
+            # Use safe attribute checks because implementations vary
+            if hasattr(tri, "remove_duplicated_vertices"):
+                try:
+                    tri.remove_duplicated_vertices()
+                except Exception:
+                    pass
+            if hasattr(tri, "remove_duplicated_triangles"):
+                try:
+                    tri.remove_duplicated_triangles()
+                except Exception:
+                    pass
+            if hasattr(tri, "remove_degenerate_triangles"):
+                try:
+                    tri.remove_degenerate_triangles()
+                except Exception:
+                    pass
+            # Avoid calling fill_holes on Open3D objects. For trimesh, try repair but guard missing deps.
+            try:
+                if hasattr(tri, "repair") and hasattr(tri.repair, "fill_holes"):
+                    tri.repair.fill_holes()
+            except Exception:
+                # repair.fill_holes may require networkx; skip if unavailable
+                pass
+            # Conservative simplification if extremely dense
+            try:
+                if hasattr(tri, "triangles") and len(tri.triangles) > 100000:
+                    target = max(50000, len(tri.triangles) // 2)
+                    tri = tri.simplify_quadratic_decimation(target)
+            except Exception:
+                pass
+            # Ensure normals are valid
+            try:
+                tri.rezero() if hasattr(tri, "rezero") else None
+                tri.compute_vertex_normals()
+            except Exception:
+                pass
+            print(f"Mesh optimization completed: {len(tri.vertices)} vertices, {len(tri.faces) if hasattr(tri, 'faces') else len(tri.triangles)} faces")
+            return tri
+        except Exception as e:
+            print(f"Mesh topology optimization failed: {e}")
+            return mesh
+
+    def advanced_point_cloud_preprocessing(self, pcd):
+        """Advanced preprocessing with intelligent parameter selection"""
+        try:
+            print("🧠 Analyzing point cloud characteristics...")
+            # Analyze point cloud properties
+            points = np.asarray(pcd.points)
+            bbox = pcd.get_axis_aligned_bounding_box()
+            volume = bbox.volume()
+            density = len(points) / (volume + 1e-6)
+            extent = bbox.extent()
+            print(f"📊 Point cloud analysis:")
+            print(f"   - Density: {density:.2f} points/unit³")
+            print(f"   - Extent: {extent}")
+            print(f"   - Volume: {volume:.6f}")
+            # Intelligent normal estimation based on analysis
+            if not pcd.has_normals():
+                print("🧭 Estimating normals with AI-powered parameters...")
+                # Adaptive search parameters based on density and extent
+                if density > 1000:  # High density
+                    radius = min(0.02, extent.min() * 0.01)
+                    max_nn = min(100, int(density * 0.1))
+                elif density > 100:  # Medium density
+                    radius = min(0.05, extent.min() * 0.02)
+                    max_nn = min(80, int(density * 0.2))
+                else:  # Low density
+                    radius = min(0.1, extent.min() * 0.05)
+                    max_nn = min(50, int(density * 0.5))
+                print(f"   - Adaptive radius: {radius:.4f}")
+                print(f"   - Adaptive max_nn: {max_nn}")
+                pcd.estimate_normals(search_param=o3d.geometry.KDTreeSearchParamHybrid(
+                    radius=radius, max_nn=max_nn))
+                # Intelligent normal orientation
+                k_orientation = min(200, max(50, int(len(points) * 0.001)))
+                pcd.orient_normals_consistent_tangent_plane(k=k_orientation)
+                print(f"   - Normal orientation k: {k_orientation}")
+            # Advanced outlier removal
+            print("🧹 Advanced outlier removal...")
+            pcd, _ = pcd.remove_statistical_outlier(nb_neighbors=20, std_ratio=2.0)
+            # Density-based filtering for very dense point clouds
+            if density > 5000:
+                print("📉 Applying density-based filtering...")
+                voxel_size = min(0.001, extent.min() * 0.001)
+                pcd = pcd.voxel_down_sample(voxel_size=voxel_size)
+                print(f"   - Voxel size: {voxel_size:.6f}")
+                print(f"   - Filtered to: {len(pcd.points)} points")
+            return pcd
+        except Exception as e:
+            print(f"⚠️ Advanced preprocessing failed: {e}")
+            return pcd
+
+    def apply_ham_color_enhancement(self, colors):
+        """Preserve original colors without ham-specific enhancement"""
+        try:
                 bufferViews=[bv_positions, bv_colors],
                 accessors=[acc_positions, acc_colors]
             )
