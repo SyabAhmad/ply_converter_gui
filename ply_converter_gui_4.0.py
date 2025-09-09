@@ -21,7 +21,9 @@ class ConversionWorker(QThread):
                  keep_all_clusters=True,
                  disable_plane_removal=True,
                  disable_z_trim=True,
-                 high_detail=True):
+                 high_detail=True,
+                 aggressive_cleanup=False,
+                 reconstruction="auto"):  # NEW
         super().__init__()
         self.input_path = input_path
         self.output_dir = output_dir
@@ -29,7 +31,8 @@ class ConversionWorker(QThread):
         self.disable_plane_removal = disable_plane_removal
         self.disable_z_trim = disable_z_trim
         self.high_detail = high_detail
-        # NEW: caches
+        self.aggressive_cleanup = aggressive_cleanup
+        self.reconstruction = reconstruction  # NEW
         self._cached_pcd = None
         self._cached_surface_pcd = None
         self._cached_mesh = None
@@ -259,65 +262,143 @@ class ConversionWorker(QThread):
         self._cached_pcd = pcd
         return pcd
 
+    def _orient_normals_outward_from_center(self, pcd):
+        """Flip normals so they point outward from cloud centroid (helps thin petals)."""
+        try:
+            if not pcd.has_normals():
+                return pcd
+            pts = np.asarray(pcd.points)
+            nrm = np.asarray(pcd.normals)
+            c = pts.mean(axis=0)
+            v = pts - c
+            flip = (np.einsum("ij,ij->i", v, nrm) < 0.0)
+            if flip.any():
+                nrm[flip] *= -1.0
+                pcd.normals = o3d.utility.Vector3dVector(nrm)
+        except Exception as e:
+            print(f"Outward normal orientation skipped: {e}")
+        return pcd
+
+    def _evaluate_mesh_quality(self, tri):
+        """Return (boundary_ratio, area, n_faces). Lower boundary_ratio is better."""
+        try:
+            # tri is a trimesh.Trimesh
+            edges_unique = len(tri.edges_unique) if hasattr(tri, "edges_unique") else 1
+            edges_boundary = len(tri.edges_boundary) if hasattr(tri, "edges_boundary") else 0
+            boundary_ratio = edges_boundary / max(1, edges_unique)
+            area = float(tri.area) if hasattr(tri, "area") else 0.0
+            faces = len(tri.faces) if hasattr(tri, "faces") else 0
+            return boundary_ratio, area, faces
+        except Exception:
+            return 1.0, 0.0, 0
+
+    def _build_mesh_poisson(self, pcd):
+        """Run Poisson with outward normals and mild density pruning."""
+        prep = pcd
+        # Data-driven normals if missing
+        if not prep.has_normals():
+            try:
+                dists = prep.compute_nearest_neighbor_distance()
+                avg = float(np.mean(dists)) if len(dists) else 0.01
+                radius = max(1e-4, 3.0 * avg)
+                prep.estimate_normals(o3d.geometry.KDTreeSearchParamHybrid(radius=radius, max_nn=60))
+                prep.orient_normals_consistent_tangent_plane(k=min(120, max(30, len(prep.points)//200)))
+            except Exception:
+                prep.estimate_normals(o3d.geometry.KDTreeSearchParamHybrid(radius=0.02, max_nn=60))
+        # Force outward orientation
+        prep = self._orient_normals_outward_from_center(prep)
+
+        n = len(prep.points)
+        base_depth = 9 if n < 200_000 else (11 if self.high_detail else 10)
+        depth = min(13, base_depth + 1)
+        self.progress.emit(f"Running Poisson (depth={depth})...")
+        mesh_o3d, densities = o3d.geometry.TriangleMesh.create_from_point_cloud_poisson(
+            prep, depth=depth, scale=1.05
+        )
+        # Keep almost all vertices (thin petals)
+        try:
+            dens = np.asarray(densities)
+            cut = float(np.quantile(dens, 0.01))
+            mesh_o3d.remove_vertices_by_mask(dens < cut)
+            mesh_o3d.remove_unreferenced_vertices()
+        except Exception:
+            pass
+        tri = trimesh.Trimesh(vertices=np.asarray(mesh_o3d.vertices),
+                              faces=np.asarray(mesh_o3d.triangles),
+                              process=True)
+        return tri
+
+    def _build_mesh_bpa(self, pcd):
+        """Ball Pivoting fallback; good on thin shells and sparse tops."""
+        prep = pcd
+        if not prep.has_normals():
+            dists = prep.compute_nearest_neighbor_distance()
+            avg = float(np.mean(dists)) if len(dists) else 0.01
+            prep.estimate_normals(o3d.geometry.KDTreeSearchParamHybrid(radius=3.0*avg, max_nn=60))
+        prep = self._orient_normals_outward_from_center(prep)
+        dists = prep.compute_nearest_neighbor_distance()
+        mean_nn = float(np.mean(dists)) if len(dists) else 0.01
+        radii = o3d.utility.DoubleVector([1.2*mean_nn, 2.0*mean_nn, 2.8*mean_nn])
+        self.progress.emit(f"Running Ball Pivoting (r≈{mean_nn:.5f})...")
+        m = o3d.geometry.TriangleMesh.create_from_point_cloud_ball_pivoting(prep, radii)
+        m.remove_unreferenced_vertices()
+        tri = trimesh.Trimesh(vertices=np.asarray(m.vertices),
+                              faces=np.asarray(m.triangles),
+                              process=True)
+        return tri
+
     def _get_surface_mesh(self, pcd):
-        """Build Poisson surface once, with density and distance pruning."""
+        """Hybrid: try Poisson; if holey/boundary-heavy, try BPA and pick the better mesh."""
         if getattr(self, "_cached_mesh", None) is not None:
             return self._cached_mesh
 
-        # If PLY already contains faces, use them
         orig_mesh = self._load_original_mesh_if_present()
         if orig_mesh is not None and len(orig_mesh.triangles) > 0:
             self._cached_mesh = orig_mesh
             return self._cached_mesh
 
-        # Preprocess points (planes/z-trim/cluster as configured)
         prep = self._prepare_point_cloud_for_reconstruction(pcd)
-        if not prep.has_normals():
-            prep.estimate_normals(o3d.geometry.KDTreeSearchParamHybrid(radius=0.02, max_nn=60))
+        # Ensure outward normals even if _prepare added them
+        prep = self._orient_normals_outward_from_center(prep)
 
-        # Adaptive Poisson depth
-        n = len(prep.points)
-        depth = 8 if n < 50_000 else 9 if n < 200_000 else (11 if self.high_detail else 10)
-        self.progress.emit(f"Running Poisson (depth={depth})...")
-        mesh, densities = o3d.geometry.TriangleMesh.create_from_point_cloud_poisson(
-            prep, depth=depth, scale=1.02
-        )
+        # Poisson
+        tri_poisson = self._build_mesh_poisson(prep)
+        br_p, area_p, faces_p = self._evaluate_mesh_quality(tri_poisson)
+        self.progress.emit(f"Poisson quality: boundary={br_p:.2%}, faces={faces_p}, area={area_p:.4f}")
 
-        # Density prune (drop weakest 5%)
-        try:
-            dens = np.asarray(densities)
-            cut = float(np.quantile(dens, 0.05))
-            mesh.remove_vertices_by_mask(dens < cut)
-            mesh.remove_unreferenced_vertices()
-        except Exception as e:
-            print(f"Density pruning skipped: {e}")
+        chosen = tri_poisson
 
-        # Convert to trimesh for cleanup
-        tri = trimesh.Trimesh(
-            vertices=np.asarray(mesh.vertices),
-            faces=np.asarray(mesh.triangles),
-            process=True
-        )
+        # Decide whether to try BPA
+        should_try_bpa = (self.reconstruction in ("auto", "bpa", "hybrid") and
+                          (br_p > 0.18 or faces_p < 1000))
+        if self.reconstruction in ("bpa", "hybrid") or should_try_bpa:
+            tri_bpa = self._build_mesh_bpa(prep)
+            br_b, area_b, faces_b = self._evaluate_mesh_quality(tri_bpa)
+            self.progress.emit(f"BPA quality:     boundary={br_b:.2%}, faces={faces_b}, area={area_b:.4f}")
+            # Pick the mesh with lower boundary ratio (primary) and larger area (tie-break)
+            if (br_b < br_p - 0.02) or (abs(br_b - br_p) < 0.02 and area_b > area_p):
+                chosen = tri_bpa
 
-        # Remove broad flat sheets and far unsupported parts
-        try:
-            pts_np = np.asarray(prep.points)
-            diag = float(np.linalg.norm(np.ptp(pts_np, axis=0)))
-            tri = self._remove_flat_mesh_components(
-                tri,
-                thickness_tol=max(1e-4, 0.01 * max(diag, 1e-6)),
-                area_ratio_threshold=0.015
-            )
-            tri = self._prune_mesh_by_point_distance(
-                tri, prep,
-                distance_factor=1.9,
-                absolute_max=0.03 * max(diag, 1e-6),
-                keep_ratio=0.85
-            )
-        except Exception as e:
-            print(f"Post-Poisson cleanup skipped: {e}")
+        # Optional cleanup (still OFF by default)
+        tri = chosen
+        if self.aggressive_cleanup:
+            try:
+                pts_np = np.asarray(prep.points)
+                diag = float(np.linalg.norm(np.ptp(pts_np, axis=0)))
+                tri = self._remove_flat_mesh_components(
+                    tri,
+                    thickness_tol=max(1e-4, 0.010 * max(diag, 1e-6)),
+                    area_ratio_threshold=0.04
+                )
+                tri = self._prune_mesh_by_point_distance(
+                    tri, prep,
+                    distance_factor=2.4,
+                    absolute_max=0.06 * max(diag, 1e-6),
+                    keep_ratio=0.95
+                )
+            except Exception as e:
+                print(f"Post cleanup skipped: {e}")
 
-        # Back to Open3D and cache
         cleaned = o3d.geometry.TriangleMesh()
         cleaned.vertices = o3d.utility.Vector3dVector(tri.vertices)
         cleaned.triangles = o3d.utility.Vector3iVector(tri.faces)
