@@ -234,6 +234,101 @@ class ConversionWorker(QThread):
         except Exception as e:
             print(f"GLB export failed: {e}")
 
+    def _get_base_pcd(self):
+        """Load point cloud once, normalize colors, light downsample."""
+        if getattr(self, "_cached_pcd", None) is not None:
+            return self._cached_pcd
+        self.progress.emit("Loading point cloud...")
+        pcd = o3d.io.read_point_cloud(self.input_path)
+
+        # Normalize colors to [0,1]
+        if pcd.has_colors():
+            cols = np.asarray(pcd.colors)
+            if cols.max() > 1.0:
+                cols = cols / 255.0
+            pcd.colors = o3d.utility.Vector3dVector(np.clip(cols, 0, 1))
+
+        # Light adaptive downsample for huge clouds
+        pts = np.asarray(pcd.points)
+        if len(pts) > 200_000:
+            extent = np.ptp(pts, axis=0)
+            vox = max(1e-4, float(extent.max()) * 0.003)
+            pcd = pcd.voxel_down_sample(voxel_size=vox)
+            self.progress.emit(f"Downsampled to {len(pcd.points)} points (voxel={vox:.5f})")
+
+        self._cached_pcd = pcd
+        return pcd
+
+    def _get_surface_mesh(self, pcd):
+        """Build Poisson surface once, with density and distance pruning."""
+        if getattr(self, "_cached_mesh", None) is not None:
+            return self._cached_mesh
+
+        # If PLY already contains faces, use them
+        orig_mesh = self._load_original_mesh_if_present()
+        if orig_mesh is not None and len(orig_mesh.triangles) > 0:
+            self._cached_mesh = orig_mesh
+            return self._cached_mesh
+
+        # Preprocess points (planes/z-trim/cluster as configured)
+        prep = self._prepare_point_cloud_for_reconstruction(pcd)
+        if not prep.has_normals():
+            prep.estimate_normals(o3d.geometry.KDTreeSearchParamHybrid(radius=0.02, max_nn=60))
+
+        # Adaptive Poisson depth
+        n = len(prep.points)
+        depth = 8 if n < 50_000 else 9 if n < 200_000 else (11 if self.high_detail else 10)
+        self.progress.emit(f"Running Poisson (depth={depth})...")
+        mesh, densities = o3d.geometry.TriangleMesh.create_from_point_cloud_poisson(
+            prep, depth=depth, scale=1.02
+        )
+
+        # Density prune (drop weakest 5%)
+        try:
+            dens = np.asarray(densities)
+            cut = float(np.quantile(dens, 0.05))
+            mesh.remove_vertices_by_mask(dens < cut)
+            mesh.remove_unreferenced_vertices()
+        except Exception as e:
+            print(f"Density pruning skipped: {e}")
+
+        # Convert to trimesh for cleanup
+        tri = trimesh.Trimesh(
+            vertices=np.asarray(mesh.vertices),
+            faces=np.asarray(mesh.triangles),
+            process=True
+        )
+
+        # Remove broad flat sheets and far unsupported parts
+        try:
+            pts_np = np.asarray(prep.points)
+            diag = float(np.linalg.norm(np.ptp(pts_np, axis=0)))
+            tri = self._remove_flat_mesh_components(
+                tri,
+                thickness_tol=max(1e-4, 0.01 * max(diag, 1e-6)),
+                area_ratio_threshold=0.015
+            )
+            tri = self._prune_mesh_by_point_distance(
+                tri, prep,
+                distance_factor=1.9,
+                absolute_max=0.03 * max(diag, 1e-6),
+                keep_ratio=0.85
+            )
+        except Exception as e:
+            print(f"Post-Poisson cleanup skipped: {e}")
+
+        # Back to Open3D and cache
+        cleaned = o3d.geometry.TriangleMesh()
+        cleaned.vertices = o3d.utility.Vector3dVector(tri.vertices)
+        cleaned.triangles = o3d.utility.Vector3iVector(tri.faces)
+        cleaned.remove_unreferenced_vertices()
+        if len(cleaned.vertices) > 0:
+            cleaned.compute_vertex_normals()
+
+        self._cached_surface_pcd = prep
+        self._cached_mesh = cleaned
+        return cleaned
+
     def enhance_colors_vectorized(self, rgb_colors):
         """Preserve original colors without enhancement"""
         # Simply normalize colors to 0-1 range
@@ -681,15 +776,12 @@ class ConversionWorker(QThread):
     def apply_ham_color_enhancement(self, colors):
         """Preserve original colors without ham-specific enhancement"""
         try:
-                bufferViews=[bv_positions, bv_colors],
-                accessors=[acc_positions, acc_colors]
-            )
-            # Attach binary data and save
-            gltf.set_binary_blob(bin_blob)
-            gltf.save_binary(output_path)
-            print(f"Fallback point cloud GLB exported: {output_path}")
+            # Simply return the original colors without any modification
+            print("Preserving original colors without enhancement")
+            return colors
         except Exception as e:
-            print(f"Fallback GLB export also failed: {e}")
+            print(f"Color preservation failed: {e}")
+            return colors
 
     def smooth_mesh_for_ham(self, mesh):
         """Apply specialized smoothing to make the mesh look more like real ham"""
