@@ -149,132 +149,82 @@ class ConversionWorker(QThread):
             return self.transfer_colors_to_mesh(pcd, mesh)
 
     def export_point_cloud_stl(self, pcd, output_path, mesh=None):
-        """Export STL reusing cached mesh if provided."""
+        """Robust STL export: always convert to trimesh and write via trimesh; fallback to proxy if needed."""
         try:
+            tri = None
+            # Prefer original mesh if present
             orig_mesh = self._load_original_mesh_if_present()
             if orig_mesh is not None:
-                try:
-                    print("Writing STL via Open3D (original mesh)...")
-                    o3d.io.write_triangle_mesh(output_path, orig_mesh, write_ascii=False)
-                except Exception as o3d_err:
-                    print(f"Open3D STL write failed, trying trimesh: {o3d_err}")
-                    tri = trimesh.Trimesh(vertices=np.asarray(orig_mesh.vertices),
-                                          faces=np.asarray(orig_mesh.triangles).astype(np.int64, copy=False),
-                                          process=True)
-                    tri.export(output_path, file_type='stl')
+                tri = self._ensure_trimesh(orig_mesh)
+            # Else use provided mesh or reconstruct
+            if tri is None:
+                if mesh is None:
+                    mesh = self._get_surface_mesh(pcd)
+                tri = self._ensure_trimesh(mesh)
+            # Fallback proxy if still no faces
+            if tri is None or len(getattr(tri, 'faces', [])) == 0:
+                self.progress.emit("Building proxy mesh fallback for STL...")
+                proxy = self._build_fallback_proxy_mesh(pcd)
+                tri = proxy
+            if tri is None or len(getattr(tri, 'faces', [])) == 0:
+                self.progress.emit("No triangles available for STL; skipping")
                 return
-
-            if mesh is None:
-                mesh = self._get_surface_mesh(pcd)
-
-            # Build trimesh safely
-            if mesh is not None and hasattr(mesh, 'triangles') and len(mesh.triangles) > 0:
-                try:
-                    # Try Open3D writer first - Ensure mesh is o3d.TriangleMesh
-                    print("Writing STL via Open3D (reconstructed mesh)...")
-                    if isinstance(mesh, o3d.geometry.TriangleMesh):
-                        o3d.io.write_triangle_mesh(output_path, mesh, write_ascii=False)
-                    else:  # If it's a trimesh, convert it
-                        o3d_mesh = o3d.geometry.TriangleMesh()
-                        o3d_mesh.vertices = o3d.utility.Vector3dVector(mesh.vertices)
-                        o3d_mesh.triangles = o3d.utility.Vector3iVector(mesh.faces)
-                        o3d.io.write_triangle_mesh(output_path, o3d_mesh, write_ascii=False)
-                    return
-                except Exception as o3d_err:
-                    print(f"Open3D STL write failed, trying trimesh: {o3d_err}")
-                    try:
-                        if isinstance(mesh, o3d.geometry.TriangleMesh):
-                            verts = np.asarray(mesh.vertices)
-                            faces = np.asarray(mesh.triangles)
-                        else:  # Assume trimesh
-                            verts = mesh.vertices
-                            faces = mesh.faces
-                        if faces.dtype != np.int64 and faces.dtype != np.int32:
-                            faces = faces.astype(np.int64)
-                        tri = trimesh.Trimesh(vertices=verts, faces=faces, process=True)
-                        tri.export(output_path, file_type='stl')
-                        return
-                    except Exception as export_err:
-                        print(f"Primary STL export failed, will try fallback: {export_err}")
-
-            # Fallback proxy mesh if no triangles or export failed
-            print("Building proxy mesh fallback for STL...")
-            proxy = self._build_fallback_proxy_mesh(pcd)
-            if proxy is None or len(getattr(proxy, 'faces', [])) == 0:
-                print("No mesh for STL after fallback.")
-                return
-            proxy.export(output_path, file_type='stl')
+            # Ensure faces int dtype
+            if tri.faces.dtype != np.int64 and tri.faces.dtype != np.int32:
+                tri.faces = tri.faces.astype(np.int64)
+            # Export and validate non-empty file
+            tri.export(output_path, file_type='stl')
+            if not (os.path.exists(output_path) and os.path.getsize(output_path) > 0):
+                raise RuntimeError("STL writer produced empty file")
         except Exception as e:
             print(f"STL export failed: {e}")
 
-
-
     def export_point_cloud_3mf(self, pcd, output_path, mesh=None):
-        """Use cached mesh; skip cube fallback on large clouds."""
+        """Robust 3MF export: convert to trimesh and export; fallback to proxy if needed."""
         try:
+            tri = None
             orig_mesh = self._load_original_mesh_if_present()
             if orig_mesh is not None:
-                trimesh.Trimesh(np.asarray(orig_mesh.vertices),
-                                np.asarray(orig_mesh.triangles),
-                                process=True).export(output_path, file_type='3mf')
-                return
-
-            if mesh is None:
-                mesh = self._get_surface_mesh(pcd)
-
-            if mesh is not None and hasattr(mesh, 'triangles') and len(mesh.triangles) > 0:
-                try:
-                    if isinstance(mesh, o3d.geometry.TriangleMesh):
-                        verts = np.asarray(mesh.vertices)
-                        faces = np.asarray(mesh.triangles)
-                    else:  # Assume trimesh
-                        verts = mesh.vertices
-                        faces = mesh.faces
-                    if faces.dtype != np.int64 and faces.dtype != np.int32:
-                        faces = faces.astype(np.int64)
-                    tri = trimesh.Trimesh(vertices=verts, faces=faces, process=True)
-                    tri.export(output_path, file_type='3mf')
-                    return
-                except Exception as export_err:
-                    print(f"Primary 3MF export failed, will try fallback: {export_err}")
-
-            # Fallback proxy mesh
-            print("Building proxy mesh fallback for 3MF...")
-            proxy = self._build_fallback_proxy_mesh(pcd)
-            if proxy is None or len(getattr(proxy, 'faces', [])) == 0:
-                print("No surface mesh; skipping 3MF after fallback.")
-                return
-            proxy.export(output_path, file_type='3mf')
-        except Exception as e:
-            print(f"3MF export failed: {e}")
-    
-    def export_point_cloud_dxf(self, pcd, output_path, mesh=None):
-        """Use cached mesh for DXF."""
-        try:
-            orig_mesh = self._load_original_mesh_if_present()
-            if orig_mesh is not None:
-                verts = np.asarray(orig_mesh.vertices, dtype=np.float64)
-                faces = np.asarray(orig_mesh.triangles, dtype=np.int64)
-            else:
+                tri = self._ensure_trimesh(orig_mesh)
+            if tri is None:
                 if mesh is None:
                     mesh = self._get_surface_mesh(pcd)
-                if mesh is None or len(mesh.triangles) == 0:
-                    # Fallback to proxy mesh for indices
-                    print("Building proxy mesh fallback for DXF...")
-                    proxy = self._build_fallback_proxy_mesh(pcd)
-                    if proxy is None or len(getattr(proxy, 'faces', [])) == 0:
-                        print("No surface mesh; DXF skipped.")
-                        return
-                    verts = np.asarray(proxy.vertices, dtype=np.float64)
-                    faces = np.asarray(proxy.faces, dtype=np.int64)
-                else:
-                    if isinstance(mesh, o3d.geometry.TriangleMesh):
-                        verts = np.asarray(mesh.vertices, dtype=np.float64)
-                        faces = np.asarray(mesh.triangles, dtype=np.int64)
-                    else:  # Assume trimesh
-                        verts = np.asarray(mesh.vertices, dtype=np.float64)
-                        faces = np.asarray(mesh.faces, dtype=np.int64)
+                tri = self._ensure_trimesh(mesh)
+            if tri is None or len(getattr(tri, 'faces', [])) == 0:
+                self.progress.emit("Building proxy mesh fallback for 3MF...")
+                proxy = self._build_fallback_proxy_mesh(pcd)
+                tri = proxy
+            if tri is None or len(getattr(tri, 'faces', [])) == 0:
+                self.progress.emit("No triangles available for 3MF; skipping")
+                return
+            if tri.faces.dtype != np.int64 and tri.faces.dtype != np.int32:
+                tri.faces = tri.faces.astype(np.int64)
+            tri.export(output_path, file_type='3mf')
+            if not (os.path.exists(output_path) and os.path.getsize(output_path) > 0):
+                raise RuntimeError("3MF writer produced empty file")
+        except Exception as e:
+            print(f"3MF export failed: {e}")
 
+    def export_point_cloud_dxf(self, pcd, output_path, mesh=None):
+        """Robust DXF export using current triangles; fallback to proxy when necessary."""
+        try:
+            tri = None
+            orig_mesh = self._load_original_mesh_if_present()
+            if orig_mesh is not None:
+                tri = self._ensure_trimesh(orig_mesh)
+            if tri is None:
+                if mesh is None:
+                    mesh = self._get_surface_mesh(pcd)
+                tri = self._ensure_trimesh(mesh)
+            if tri is None or len(getattr(tri, 'faces', [])) == 0:
+                self.progress.emit("Building proxy mesh fallback for DXF...")
+                proxy = self._build_fallback_proxy_mesh(pcd)
+                tri = proxy
+            if tri is None or len(getattr(tri, 'faces', [])) == 0:
+                self.progress.emit("No triangles available for DXF; skipping")
+                return
+            verts = np.asarray(tri.vertices, dtype=np.float64)
+            faces = np.asarray(tri.faces, dtype=np.int64)
             import ezdxf
             doc = ezdxf.new('R2010')
             msp = doc.modelspace()
@@ -284,9 +234,11 @@ class ConversionWorker(QThread):
                     [float(v1[0]), float(v1[1]), float(v1[2])],
                     [float(v2[0]), float(v2[1]), float(v2[2])],
                     [float(v3[0]), float(v3[1]), float(v3[2])],
-                    [float(v1[0]), float(v1[1]), float(v1[2])]  # Close the face
+                    [float(v1[0]), float(v1[1]), float(v1[2])]
                 ])
             doc.saveas(output_path)
+            if not (os.path.exists(output_path) and os.path.getsize(output_path) > 0):
+                raise RuntimeError("DXF writer produced empty file")
         except Exception as e:
             print(f"DXF export failed: {e}")
  
@@ -405,24 +357,24 @@ class ConversionWorker(QThread):
             try:
                 dists = prep.compute_nearest_neighbor_distance()
                 avg = float(np.mean(dists)) if len(dists) else 0.01
-                radius = max(1e-4, 3.0 * avg)
+                radius = max(1e-4, 2.5 * avg)
                 prep.estimate_normals(o3d.geometry.KDTreeSearchParamHybrid(radius=radius, max_nn=60))
                 prep.orient_normals_consistent_tangent_plane(k=min(120, max(30, len(prep.points)//200)))
             except Exception:
-                prep.estimate_normals(o3d.geometry.KDTreeSearchParamHybrid(radius=0.02, max_nn=60))
+                prep.estimate_normals(o3d.geometry.KDTreeSearchParamHybrid(radius=0.38, max_nn=20))
         # Force outward orientation
         prep = self._orient_normals_outward_from_center(prep)
         n = len(prep.points)
-        base_depth = 9 if n < 200_000 else (11 if self.high_detail else 10)
-        depth = min(13, base_depth + 1)
+        base_depth = 10 if n < 200_000 else (9 if self.high_detail else 11)
+        depth = min(20, base_depth+1)
         self.progress.emit(f"Running Poisson (depth={depth})...")
         mesh_o3d, densities = o3d.geometry.TriangleMesh.create_from_point_cloud_poisson(
-            prep, depth=depth, scale=1.05
+            prep, depth=depth, scale=1.15, linear_fit=True
         )
         # Keep almost all vertices (thin petals)
         try:
             dens = np.asarray(densities)
-            cut = float(np.quantile(dens, 0.01))
+            cut = float(np.quantile(dens, 0.015))
             mesh_o3d.remove_vertices_by_mask(dens < cut)
             mesh_o3d.remove_unreferenced_vertices()
         except Exception:
@@ -442,7 +394,7 @@ class ConversionWorker(QThread):
         prep = self._orient_normals_outward_from_center(prep)
         dists = prep.compute_nearest_neighbor_distance()
         mean_nn = float(np.mean(dists)) if len(dists) else 0.01
-        radii = o3d.utility.DoubleVector([1.2*mean_nn, 2.0*mean_nn, 2.8*mean_nn])
+        radii = o3d.utility.DoubleVector([1.0*mean_nn, 1.5*mean_nn, 2.0*mean_nn, 2.5*mean_nn, 3.0*mean_nn])
         self.progress.emit(f"Running Ball Pivoting (r≈{mean_nn:.5f})...")
         m = o3d.geometry.TriangleMesh.create_from_point_cloud_ball_pivoting(prep, radii)
         m.remove_unreferenced_vertices()
@@ -698,11 +650,41 @@ class ConversionWorker(QThread):
         except Exception as e:
             print(f"Fallback GLB export also failed: {e}")
 
+    def _conservative_mesh_repair(self, tri_mesh):
+        """Conservative mesh repair that preserves structure"""
+        try:
+            print("� Applying conservative mesh repair...")
+            # Only fix obvious issues without aggressive hole filling
+            
+            # Remove duplicate vertices and degenerate faces
+            if hasattr(tri_mesh, 'remove_duplicate_faces'):
+                tri_mesh.remove_duplicate_faces()
+            if hasattr(tri_mesh, 'remove_degenerate_faces'):
+                tri_mesh.remove_degenerate_faces()
+
+            if hasattr(tri_mesh, 'fill_holes'):
+                tri_mesh.fill_holes()
+
+            
+            # Fix normals only
+            try:
+                if hasattr(tri_mesh, 'fix_normals'):
+                    tri_mesh.fix_normals()
+                elif hasattr(tri_mesh.repair, 'fix_normals'):
+                    tri_mesh.repair.fix_normals()
+            except Exception:
+                pass
+            
+            print(f"✅ Conservative repair completed: {len(tri_mesh.vertices)} vertices, {len(tri_mesh.faces)} faces")
+            return tri_mesh
+        except Exception as e:
+            print(f"⚠️ Conservative repair failed: {e}")
+            return tri_mesh
+
     def _enhance_mesh_for_export(self, mesh, pcd):
-        """Enhance mesh for export with hole filling and better topology"""
+        """Enhance mesh for export with conservative repair only"""
         try:
             print("🔧 Enhancing mesh for export...")
-            # Convert to trimesh for processing
             if isinstance(mesh, o3d.geometry.TriangleMesh):
                 tri_mesh = trimesh.Trimesh(
                     vertices=np.asarray(mesh.vertices),
@@ -712,71 +694,37 @@ class ConversionWorker(QThread):
             else:
                 tri_mesh = mesh
 
-            # Remove tiny components first
-            tri_mesh = self._remove_small_components(tri_mesh, min_area_ratio=0.003, min_face_count=200)
+            # Remove only very small disconnected components
+            tri_mesh = self._remove_small_components(tri_mesh, min_area_ratio=0.001, min_face_count=50)
 
-            # --- NEW: Robust hole filling ---
-            try:
-                print("🔍 Detecting and filling holes...")
-                # Try repair.fill_holes first (newer API)
-                if hasattr(tri_mesh.repair, 'fill_holes'):
-                    tri_mesh.repair.fill_holes()
-                else:
-                    # Fallback: use old fill_holes
-                    tri_mesh = tri_mesh.fill_holes()
+            # Apply ONLY conservative repair - no aggressive hole filling
+            tri_mesh = self._conservative_mesh_repair(tri_mesh)
 
-                # Apply subdivision to smooth and close micro-holes
-                print("🔧 Applying mesh subdivision to improve hole filling...")
-                tri_mesh = tri_mesh.subdivide(method='catmull_clark', iterations=1)
-
-                # Fix normals after subdivision
-                if hasattr(tri_mesh.repair, 'fix_normals'):
-                    tri_mesh.repair.fix_normals()
-                else:
-                    tri_mesh.fix_normals()
-            except Exception as e:
-                print(f"⚠️ Advanced hole filling failed: {e}")
-
-            # Transfer colors from point cloud
+            # Transfer colors if available
             if pcd.has_colors():
                 tri_mesh = self._transfer_colors_to_trimesh(pcd, tri_mesh)
 
-            # Optimize mesh topology
-            tri_mesh = self.optimize_mesh_topology(tri_mesh)
+            # Light topology optimization only
+            tri_mesh = self._light_mesh_optimization(tri_mesh)
 
-            # Final cleanup
-            tri_mesh = self._remove_small_components(tri_mesh, min_area_ratio=0.0015, min_face_count=50)
-
-            print(f"✅ Mesh enhanced: {len(tri_mesh.vertices)} vertices, {len(tri_mesh.faces)} faces")
+            print(f"✅ Mesh enhanced conservatively: {len(tri_mesh.vertices)} vertices, {len(tri_mesh.faces)} faces")
             return tri_mesh
         except Exception as e:
             print(f"⚠️ Mesh enhancement failed: {e}")
-            return mesh
-
-
-
+            return mesh 
+    
     def _fill_holes_in_mesh(self, tri_mesh):
-        """Fill holes in the mesh to ensure watertight geometry"""
+        """DISABLED: No hole filling to preserve original geometry"""
         try:
-            print("🔍 Detecting and filling holes...")
-            # Check if mesh has holes
-            if hasattr(tri_mesh, 'is_watertight') and tri_mesh.is_watertight:
-                print("✅ Mesh is already watertight")
-                return tri_mesh
-            # Try to fill holes using trimesh repair and fix normals
-            if hasattr(tri_mesh, 'repair') and hasattr(tri_mesh.repair, 'fill_holes'):
-                try:
-                    tri_mesh.repair.fill_holes()
-                    if hasattr(tri_mesh.repair, 'fix_normals'):
-                        tri_mesh.repair.fix_normals()
-                    print("✅ Holes filled using trimesh repair")
-                except Exception as e:
-                    print(f"⚠️ Trimesh hole filling failed: {e}")
-            # Additional hole detection and manual filling
-            tri_mesh = self._manual_hole_filling(tri_mesh)
+            print("🔍 Filling holes in mesh...")
+            if hasattr(tri_mesh, 'fill_holes'):
+                tri_mesh.fill_holes()
+            elif hasattr(tri_mesh, 'repair') and hasattr(tri_mesh.repair, 'fill_holes'):
+                tri_mesh.repair.fill_holes()
+            print(f"✅ Hole filling completed") 
             return tri_mesh
         except Exception as e:
-            print(f"⚠️ Hole filling failed: {e}")
+            print(f"⚠️ Hole filling check failed: {e}")
             return tri_mesh
 
     def _remove_small_components(self, tri_mesh, min_area_ratio=0.002, min_face_count=100):
@@ -929,6 +877,14 @@ class ConversionWorker(QThread):
         """Export enhanced GLB with proper materials and textures"""
         try:
             print("📦 Exporting enhanced GLB with materials...")
+            # Ensure we have a trimesh object, not an Open3D mesh
+            if not isinstance(tri_mesh, trimesh.Trimesh):
+                tri_mesh = self._ensure_trimesh(tri_mesh)
+            
+            if tri_mesh is None:
+                print("⚠️ Could not convert to trimesh for GLB export")
+                return
+                
             # Export using trimesh with material support
             tri_mesh.export(output_path, file_type='glb')
             # Post-process to add material properties
@@ -1030,194 +986,6 @@ class ConversionWorker(QThread):
         except Exception as e:
             print(f"⚠️ Mesh validation failed: {e}")
             return False
-
-    def smooth_mesh_for_ham(self, mesh):
-        """Apply specialized smoothing to make the mesh look more like real ham"""
-        try:
-            # Convert to Open3D mesh for better smoothing
-            o3d_mesh = o3d.geometry.TriangleMesh()
-            o3d_mesh.vertices = o3d.utility.Vector3dVector(mesh.vertices)
-            o3d_mesh.triangles = o3d.utility.Vector3iVector(mesh.faces)
-            o3d_mesh.vertex_colors = o3d.utility.Vector3dVector(mesh.vertex_colors)
-            # Apply multiple smoothing passes for organic appearance
-            print("Applying organic smoothing passes...")
-            # First pass: light smoothing to reduce sharp edges
-            o3d_mesh = o3d_mesh.filter_smooth_simple(number_of_iterations=2)
-            # Second pass: Laplacian smoothing for more natural curves
-            o3d_mesh = o3d_mesh.filter_smooth_laplacian(number_of_iterations=3)
-            # Third pass: Taubin smoothing to prevent over-smoothing
-            o3d_mesh = o3d_mesh.filter_smooth_taubin(number_of_iterations=2)
-            # Recompute normals for better lighting
-            o3d_mesh.compute_vertex_normals()
-            # Convert back to trimesh
-            smoothed_mesh = trimesh.Trimesh(
-                vertices=np.asarray(o3d_mesh.vertices),
-                faces=np.asarray(o3d_mesh.triangles),
-                vertex_colors=np.asarray(o3d_mesh.vertex_colors)
-            )
-            print("Mesh smoothing completed for realistic ham appearance")
-            return smoothed_mesh
-        except Exception as e:
-            print(f"Mesh smoothing failed: {e}")
-            return mesh
-
-    def smooth_mesh_for_ham_o3d(self, o3d_mesh):
-        """Apply specialized smoothing to Open3D mesh for realistic ham appearance"""
-        try:
-            print("Applying organic smoothing passes to Open3D mesh...")
-            # First pass: light smoothing to reduce sharp edges
-            o3d_mesh = o3d_mesh.filter_smooth_simple(number_of_iterations=3)
-            # Second pass: Laplacian smoothing for more natural curves
-            o3d_mesh = o3d_mesh.filter_smooth_laplacian(number_of_iterations=4)
-            # Third pass: Taubin smoothing to prevent over-smoothing
-            o3d_mesh = o3d_mesh.filter_smooth_taubin(number_of_iterations=3)
-            # Recompute normals for better lighting
-            o3d_mesh.compute_vertex_normals()
-            print("Open3D mesh smoothing completed for realistic ham appearance")
-            return o3d_mesh
-        except Exception as e:
-            print(f"Open3D mesh smoothing failed: {e}")
-            return o3d_mesh
-
-    def transfer_colors_to_surface_mesh(self, pcd, mesh, colors_rgba):
-        """Transfer colors from point cloud to surface mesh vertices using nearest neighbor"""
-        try:
-            # Get point cloud points and colors
-            pcd_points = np.asarray(pcd.points)
-            mesh_vertices = np.asarray(mesh.vertices)
-            # Create a KDTree for efficient nearest neighbor search
-            pcd_tree = o3d.geometry.KDTreeFlann(pcd)
-            # For each mesh vertex, find the nearest point cloud point and use its color
-            mesh_colors = np.zeros((len(mesh_vertices), 3), dtype=np.float32)
-            for i, vertex in enumerate(mesh_vertices):
-                # Find nearest neighbor
-                [k, idx, dist] = pcd_tree.search_knn_vector_3d(vertex, 1)
-                if len(idx) > 0:
-                    # Get color from nearest point
-                    mesh_colors[i] = colors_rgba[idx[0]][:3]
-            # Apply color enhancement for realistic ham appearance
-            enhanced_colors = self.apply_ham_color_enhancement(mesh_colors)
-            # Assign enhanced colors to mesh
-            mesh.vertex_colors = o3d.utility.Vector3dVector(enhanced_colors)
-            print(f"Transferred and enhanced colors from {len(pcd_points)} points to {len(mesh_vertices)} mesh vertices")
-            return mesh
-        except Exception as e:
-            print(f"Color transfer to surface mesh failed: {e}")
-            return mesh
-
-    def optimize_mesh_topology(self, mesh):
-        """Optimize mesh topology for better surface quality and ham-like appearance"""
-        try:
-            print("Applying mesh topology optimization...")
-            # If an Open3D mesh was passed in, convert to trimesh first
-            if isinstance(mesh, o3d.geometry.TriangleMesh):
-                verts = np.asarray(mesh.vertices)
-                faces = np.asarray(mesh.triangles)
-                # convert to trimesh for topology ops
-                tri = trimesh.Trimesh(vertices=verts, faces=faces, process=True)
-            else:
-                tri = mesh  # assume trimesh.Trimesh
-            # Use safe attribute checks because implementations vary
-            if hasattr(tri, "remove_duplicated_vertices"):
-                try:
-                    tri.remove_duplicated_vertices()
-                except Exception:
-                    pass
-            if hasattr(tri, "remove_duplicated_triangles"):
-                try:
-                    tri.remove_duplicated_triangles()
-                except Exception:
-                    pass
-            if hasattr(tri, "remove_degenerate_triangles"):
-                try:
-                    tri.remove_degenerate_triangles()
-                except Exception:
-                    pass
-            # Avoid calling fill_holes on Open3D objects. For trimesh, try repair but guard missing deps.
-            try:
-                if hasattr(tri, "repair") and hasattr(tri.repair, "fill_holes"):
-                    tri.repair.fill_holes()
-            except Exception:
-                # repair.fill_holes may require networkx; skip if unavailable
-                pass
-            # Conservative simplification if extremely dense
-            try:
-                if hasattr(tri, "triangles") and len(tri.triangles) > 100000:
-                    target = max(50000, len(tri.triangles) // 2)
-                    tri = tri.simplify_quadratic_decimation(target)
-            except Exception:
-                pass
-            # Ensure normals are valid
-            try:
-                tri.rezero() if hasattr(tri, "rezero") else None
-                tri.compute_vertex_normals()
-            except Exception:
-                pass
-            print(f"Mesh optimization completed: {len(tri.vertices)} vertices, {len(tri.faces) if hasattr(tri, 'faces') else len(tri.triangles)} faces")
-            return tri
-        except Exception as e:
-            print(f"Mesh topology optimization failed: {e}")
-            return mesh
-
-    def advanced_point_cloud_preprocessing(self, pcd):
-        """Advanced preprocessing with intelligent parameter selection"""
-        try:
-            print("🧠 Analyzing point cloud characteristics...")
-            # Analyze point cloud properties
-            points = np.asarray(pcd.points)
-            bbox = pcd.get_axis_aligned_bounding_box()
-            volume = bbox.volume()
-            density = len(points) / (volume + 1e-6)
-            extent = bbox.extent()
-            print(f"📊 Point cloud analysis:")
-            print(f"   - Density: {density:.2f} points/unit³")
-            print(f"   - Extent: {extent}")
-            print(f"   - Volume: {volume:.6f}")
-            # Intelligent normal estimation based on analysis
-            if not pcd.has_normals():
-                print("🧭 Estimating normals with AI-powered parameters...")
-                # Adaptive search parameters based on density and extent
-                if density > 1000:  # High density
-                    radius = min(0.02, extent.min() * 0.01)
-                    max_nn = min(100, int(density * 0.1))
-                elif density > 100:  # Medium density
-                    radius = min(0.05, extent.min() * 0.02)
-                    max_nn = min(80, int(density * 0.2))
-                else:  # Low density
-                    radius = min(0.1, extent.min() * 0.05)
-                    max_nn = min(50, int(density * 0.5))
-                print(f"   - Adaptive radius: {radius:.4f}")
-                print(f"   - Adaptive max_nn: {max_nn}")
-                pcd.estimate_normals(search_param=o3d.geometry.KDTreeSearchParamHybrid(
-                    radius=radius, max_nn=max_nn))
-                # Intelligent normal orientation
-                k_orientation = min(200, max(50, int(len(points) * 0.001)))
-                pcd.orient_normals_consistent_tangent_plane(k=k_orientation)
-                print(f"   - Normal orientation k: {k_orientation}")
-            # Advanced outlier removal
-            print("🧹 Advanced outlier removal...")
-            pcd, _ = pcd.remove_statistical_outlier(nb_neighbors=20, std_ratio=2.0)
-            # Density-based filtering for very dense point clouds
-            if density > 5000:
-                print("📉 Applying density-based filtering...")
-                voxel_size = min(0.001, extent.min() * 0.001)
-                pcd = pcd.voxel_down_sample(voxel_size=voxel_size)
-                print(f"   - Voxel size: {voxel_size:.6f}")
-                print(f"   - Filtered to: {len(pcd.points)} points")
-            return pcd
-        except Exception as e:
-            print(f"⚠️ Advanced preprocessing failed: {e}")
-            return pcd
-
-    def apply_ham_color_enhancement(self, colors):
-        """Preserve original colors without ham-specific enhancement"""
-        try:
-            # Simply return the original colors without any modification
-            print("Preserving original colors without enhancement")
-            return colors
-        except Exception as e:
-            print(f"Color preservation failed: {e}")
-            return colors
 
     def smooth_mesh_for_ham(self, mesh):
         """Apply specialized smoothing to make the mesh look more like real ham"""
@@ -1686,6 +1454,61 @@ class ConversionWorker(QThread):
             print(f"Could not load original mesh from PLY: {e}")
             return None
 
+    def _ensure_trimesh(self, mesh):
+        """Convert various mesh types to a trimesh.Trimesh safely, or return None."""
+        try:
+            if mesh is None:
+                return None
+            if isinstance(mesh, trimesh.Trimesh):
+                return mesh
+            if isinstance(mesh, o3d.geometry.TriangleMesh):
+                verts = np.asarray(mesh.vertices)
+                faces = np.asarray(mesh.triangles)
+                if faces.dtype != np.int64 and faces.dtype != np.int32:
+                    faces = faces.astype(np.int64, copy=False)
+                return trimesh.Trimesh(vertices=verts, faces=faces, process=True)
+            # Generic case if it exposes vertices/faces arrays
+            if hasattr(mesh, 'vertices') and hasattr(mesh, 'faces'):
+                verts = np.asarray(mesh.vertices)
+                faces = np.asarray(mesh.faces)
+                if faces.dtype != np.int64 and faces.dtype != np.int32:
+                    faces = faces.astype(np.int64, copy=False)
+                return trimesh.Trimesh(vertices=verts, faces=faces, process=True)
+        except Exception as e:
+            print(f"_ensure_trimesh failed: {e}")
+        return None
+
+    def _light_mesh_optimization(self, tri_mesh):
+        """Very light mesh optimization that preserves geometry"""
+        try:
+            print("🔧 Applying light mesh optimization...")
+            
+            # Only remove obvious duplicates and degenerates
+            if hasattr(tri_mesh, 'remove_duplicate_faces'):
+                try:
+                    tri_mesh.remove_duplicate_faces()
+                except Exception:
+                    pass
+            
+            if hasattr(tri_mesh, 'remove_degenerate_faces'):
+                try:
+                    tri_mesh.remove_degenerate_faces()
+                except Exception:
+                    pass
+            
+            # Fix vertex ordering for consistent normals
+            try:
+                if hasattr(tri_mesh, 'fix_normals'):
+                    tri_mesh.fix_normals()
+            except Exception:
+                pass
+            
+            print(f"✅ Light optimization completed: {len(tri_mesh.vertices)} vertices, {len(tri_mesh.faces)} faces")
+            return tri_mesh
+        except Exception as e:
+            print(f"⚠️ Light optimization failed: {e}")
+            return tri_mesh
+
 
 # --- Main GUI Application Class ---
 class PLYConverterGUI(QMainWindow):
@@ -1744,7 +1567,11 @@ class PLYConverterGUI(QMainWindow):
         progress_layout = QVBoxLayout()
         progress_frame.setLayout(progress_layout)
         self.progress_bar = QProgressBar()
-        self.progress_bar.setRange(0, 0)  # Indeterminate
+        self.progress_bar.setRange(0, 0)  # Indeter# The above code is simply calling the `min`
+        # function in Python. The `min` function is used to
+        # find the minimum value among the arguments passed
+        # to it.
+        
         self.progress_bar.setVisible(False)
         progress_layout.addWidget(self.progress_bar)
         self.log_text_edit = QTextEdit()
